@@ -6,3 +6,4 @@ lib/
 *.wuhb
 *.rpx.map
 .DS_Store
+data/

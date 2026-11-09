@@ -38,6 +38,7 @@ make test       # host test of the controller.ini reader (no devkitPro needed)
 make WITH_GCADAPTER=0   # leave out the GameCube adapter
 make WITH_HIDPADS=0     # leave out USB game controllers and their forty layouts
 make WITH_TABLET=0      # leave out pen tablets and the uDraw
+make WITH_MIC=0         # leave out the microphones
 ```
 
 All three are on by default and need no other library. Link with `-linput-wiiu -lwut -lm`.
@@ -182,6 +183,23 @@ while it is fresh; `classic_from` says which was used (`K`PAD, `W`PAD or `R`egis
 offered: VID:PID, interface, subclass/protocol, report size, what the library made of it, how many
 reports came and were read, and the start of the last one. The test program shows all of this, and writes every driver's log to
 `sd:/padtest.log`.
+
+### Microphones
+
+Three drivers with the same calls (open, start, read what has come, stop, close), all 16-bit mono:
+
+```c
+#include <input_drcmic.h>   /* DM_*: the GamePad's own microphone, through mic.rpl */
+#include <input_usbmic.h>   /* UM_*: any class-compliant (UAC 1.0) USB microphone */
+#include <input_wiispeak.h> /* WS_*: the Wii Speak, either USB port */
+```
+
+The USB microphone and the Wii Speak are libwiiinput's drivers, moved from IOS's `/dev/usb/oh0`
+onto the Wii U's USB host stack (`nsysuhs`), isochronous streams included. The Wii Speak needs its
+boot firmware, which is Nintendo's and never in this repository: pass it to `WS_Open`, or build it in
+with `PMIC_FIRM=<file>` (or `data/pmic_firm.bin`, which `tools/extract_pmic_firmware.py` takes out
+of the RVL SDK's `pmic.a`) and use `WS_BuiltinFirmware`. The test program loads it from
+`sd:/pmic_firm.bin` and shows a level meter for each microphone. `make WITH_MIC=0` leaves them out.
 
 ### Keyboard and mouse
 

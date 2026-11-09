@@ -9,12 +9,15 @@
  *     where it touches (bigger with more pressure)
  *   - per Wii Remote channel, what KPAD and WPAD report, for finding out
  *     why an extension is not read
+ *   - the microphones: the GamePad's, a USB microphone and the Wii Speak
+ *     (with its firmware at sd:/pmic_firm.bin), each with a level meter
  *   - every driver's log, on screen and in sd:/padtest.log
  *   - A+B held on a controller rumbles that controller
  *   - HOME (or Esc) held for two seconds exits
  */
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <coreinit/cache.h>
@@ -28,7 +31,10 @@
 #include <sysapp/launch.h>
 #include <whb/proc.h>
 
+#include <input_drcmic.h>
 #include <input_tablet.h>
+#include <input_usbmic.h>
+#include <input_wiispeak.h>
 #include <input_wiiu.h>
 
 #define HEAP_TAG 0x50414454 /* 'PADT' */
@@ -240,6 +246,167 @@ static void log_usb(void)
     }
 }
 
+/* ---- microphones ----------------------------------------------------------
+ * Opened from a thread of their own: the Wii Speak takes its firmware and
+ * may need seconds to come up. Whatever is not open is tried again every
+ * few seconds, so a mic plugged in later is found. */
+static OSThread mic_thread;
+static uint8_t mic_stack[0x4000] __attribute__((aligned(16)));
+static bool mic_running;
+static volatile bool mic_quit, dm_ok, um_ok, ws_ok, ws_booting;
+static volatile int ws_result = 1; /* 1: not tried */
+static um_info um_dev;
+static uint8_t *ws_firm;
+static uint32_t ws_firm_size;
+
+static bool mic_cancel(void) { return mic_quit; }
+
+static void load_firmware(void)
+{
+    static const char *paths[] = { "fs:/vol/external01/pmic_firm.bin", "fs:/vol/external01/wiiu/pmic_firm.bin" };
+    const uint8_t *built = WS_BuiltinFirmware(&ws_firm_size);
+
+    if (built) {
+        ws_firm = (uint8_t *)built;
+        return;
+    }
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]) && !ws_firm; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        long n;
+        if (!f)
+            continue;
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && n < 0x40000 && (ws_firm = malloc((size_t)n))) {
+            if (fread(ws_firm, 1, (size_t)n, f) == (size_t)n) {
+                ws_firm_size = (uint32_t)n;
+                log_print("Wii Speak firmware: %s, %ld bytes\n", paths[i], n);
+            } else {
+                free(ws_firm);
+                ws_firm = NULL;
+            }
+        }
+        fclose(f);
+    }
+    if (!ws_firm)
+        log_print("Wii Speak: no firmware at sd:/pmic_firm.bin\n");
+}
+
+static int mic_main(int argc, const char **argv)
+{
+    (void)argc;
+    (void)argv;
+    load_firmware();
+    while (!mic_quit) {
+        if (!dm_ok && DM_Open(0) == DM_OK) {
+            if (DM_Start() == DM_OK)
+                dm_ok = true;
+            else
+                DM_Close();
+        }
+        if (!um_ok && UM_Open(&um_dev) == UM_OK) {
+            if (UM_Start() == UM_OK)
+                um_ok = true;
+            else
+                UM_Close();
+        }
+        if (!ws_ok && ws_firm && !mic_quit) {
+            ws_booting = true;
+            ws_result = WS_Open(ws_firm, ws_firm_size);
+            if (ws_result == WS_OK) {
+                WS_Start();
+                ws_ok = true;
+            }
+            ws_booting = false;
+        }
+        for (int i = 0; i < 30 && !mic_quit; i++)
+            OSSleepTicks(OSMillisecondsToTicks(100));
+    }
+    return 0;
+}
+
+static void mic_start(void)
+{
+    DM_SetLog(log_print);
+    UM_SetLog(log_print);
+    WS_SetLog(log_print);
+    WS_SetCancel(mic_cancel);
+    if (OSCreateThread(&mic_thread, mic_main, 0, NULL, mic_stack + sizeof(mic_stack), sizeof(mic_stack), 20,
+                       OS_THREAD_ATTRIB_AFFINITY_ANY)) {
+        OSSetThreadName(&mic_thread, "padtest mics");
+        OSResumeThread(&mic_thread);
+        mic_running = true;
+    }
+}
+
+static void mic_stop(void)
+{
+    int r;
+
+    mic_quit = true;
+    if (mic_running)
+        OSJoinThread(&mic_thread, &r);
+    if (dm_ok)
+        DM_Close();
+    if (um_ok)
+        UM_Close();
+    if (ws_ok)
+        WS_Close();
+}
+
+/* Each mic's loudest sample in the last tenth of a second or so. */
+static int mic_peak[3];
+static uint32_t mic_total[3];
+
+static void take_mics(void)
+{
+    static int16_t buf[4096];
+    uint32_t n;
+    int peak;
+
+    for (int m = 0; m < 3; m++) {
+        bool on = m == 0 ? dm_ok : m == 1 ? um_ok : ws_ok;
+        if (!on)
+            continue;
+        peak = mic_peak[m] * 7 / 8; /* falls back slowly */
+        do {
+            n = m == 0 ? DM_Read(buf, 4096) : m == 1 ? UM_Read(buf, 4096) : WS_Read(buf, 4096);
+            for (uint32_t i = 0; i < n; i++) {
+                int a = buf[i] < 0 ? -buf[i] : buf[i];
+                if (a > peak)
+                    peak = a;
+            }
+            mic_total[m] += n;
+        } while (n == 4096);
+        mic_peak[m] = peak;
+    }
+}
+
+static void meter(char *out, int peak)
+{
+    int bars = peak * 10 / 32768;
+    for (int i = 0; i < 10; i++)
+        out[i] = i < bars ? '#' : '.';
+    out[10] = 0;
+}
+
+static void mic_row(int row)
+{
+    char gp[12], usb[12], ws[12], wss[24];
+
+    meter(gp, mic_peak[0]);
+    meter(usb, mic_peak[1]);
+    meter(ws, mic_peak[2]);
+    if (ws_ok)
+        snprintf(wss, sizeof(wss), "%s %lu", ws, (unsigned long)mic_total[2]);
+    else
+        snprintf(wss, sizeof(wss), "%s", ws_booting ? "booting..." : !ws_firm ? "no firmware" :
+                 ws_result == WS_ENODEV ? "none" : ws_result == 1 ? "-" : "failed");
+    text(row, 0, "Mics     GamePad %s %lu | USB %s %s | Wii Speak %s",
+         dm_ok ? gp : "none", (unsigned long)mic_total[0], um_ok ? usb : "none", um_ok ? um_dev.name : "", wss);
+}
+
 /* Where the pen touched, newest last, in TV coordinates. */
 #define TRAIL 1024
 static struct { int16_t x, y; uint8_t size; } trail[TRAIL];
@@ -383,6 +550,8 @@ static void draw(void)
             text(row++, 0, "log: %.90s", log_lines[i % LOG_LINES]);
     }
 
+    mic_row(27);
+
     uint32_t shown = trail_count < TRAIL ? trail_count : TRAIL;
     for (uint32_t i = 0; i < shown; i++) {
         uint32_t k = (trail_count - shown + i) % TRAIL;
@@ -430,10 +599,12 @@ int main(int argc, char **argv)
     INPUT_Init();
     TB_Init();
     INPUT_SetScreenSize(TV_W, TV_H);
+    mic_start();
 
     while (WHBProcIsRunning()) {
         INPUT_Update();
         take_pen();
+        take_mics();
         log_usb();
         save_log();
 
@@ -474,6 +645,7 @@ int main(int argc, char **argv)
         OSSleepTicks(OSMillisecondsToTicks(16));
     }
 
+    mic_stop();
     TB_Shutdown();
     INPUT_Shutdown();
     save_log();

@@ -20,6 +20,9 @@ WITH_GCADAPTER ?= 1
 WITH_HIDPADS   ?= 1
 # USB pen tablets and the uDraw GameTablet (input_tablet.h)
 WITH_TABLET    ?= 1
+# Microphones: the Wii Speak, USB microphones and the GamePad's
+# (input_wiispeak.h, input_usbmic.h, input_drcmic.h)
+WITH_MIC       ?= 1
 ifeq ($(WITH_GCADAPTER),1)
  CFLAGS += -DHAVE_GCADAPTER
 endif
@@ -29,13 +32,24 @@ endif
 ifeq ($(WITH_TABLET),1)
  CFLAGS += -DHAVE_TABLET
 endif
+ifeq ($(WITH_MIC),1)
+ CFLAGS += -DHAVE_MIC
+ # The Wii Speak's boot firmware is Nintendo's and never in this repository:
+ # PMIC_FIRM=<file>, or data/pmic_firm.bin (tools/extract_pmic_firmware.py
+ # takes it out of the RVL SDK's pmic.a), builds it in for WS_BuiltinFirmware.
+ PMIC_FIRM ?= $(wildcard data/pmic_firm.bin)
+ ifneq ($(strip $(PMIC_FIRM)),)
+  CFLAGS += -DWS_FIRMWARE_FILE='"$(abspath $(PMIC_FIRM))"'
+ endif
+endif
 
 SRCS    := $(wildcard source/*.c)
 # one folder of objects for each set of options, so switching them rebuilds
-BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)$(WITH_TABLET)
+BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)$(WITH_TABLET)$(WITH_MIC)$(if $(PMIC_FIRM),f)
 OBJS    := $(patsubst source/%.c,$(BUILD)/%.o,$(SRCS))
 LIB     := lib/libinput-wiiu.a
-HEADERS := source/libinput_internal.h source/libinput_hid.h source/libinput_hidparse.h include/input_wiiu.h include/input_tablet.h
+PUBLIC  := include/input_wiiu.h include/input_tablet.h include/input_wiispeak.h include/input_usbmic.h include/input_drcmic.h
+HEADERS := source/libinput_internal.h source/libinput_hid.h source/libinput_hidparse.h source/libinput_uhs.h $(PUBLIC)
 
 all: $(LIB)
 
@@ -52,7 +66,7 @@ $(BUILD)/%.o: source/%.c $(HEADERS)
 install: $(LIB)
 	@mkdir -p $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/lib $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include
 	cp $(LIB) $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/lib/
-	cp include/input_wiiu.h include/input_tablet.h $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include/
+	cp $(PUBLIC) $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include/
 
 # the controller test program (example/padtest), a .wuhb for the Homebrew Launcher
 padtest: $(LIB)
