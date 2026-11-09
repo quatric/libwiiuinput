@@ -134,8 +134,10 @@ typedef enum {
     INPUT_DEV_GAMEPAD = 0,  /* Wii U GamePad (VPAD) */
     INPUT_DEV_WIIMOTE,      /* Wii Remote, alone or with an extension */
     INPUT_DEV_PRO,          /* Wii U Pro Controller */
-    INPUT_DEV_GAMECUBE,     /* a port of the GameCube controller adapter */
-    INPUT_DEV_USBPAD        /* USB game controller with a Nintendont layout */
+    INPUT_DEV_GAMECUBE,     /* a console GameCube port (Wii only, never listed here) */
+    INPUT_DEV_USBPAD,       /* USB game controller with a Nintendont layout */
+    INPUT_DEV_GCADAPTER,    /* a port of the GameCube controller adapter */
+    INPUT_DEV_DS3           /* DualShock 3 through libsicksaxis (Wii only; here it is a USB pad) */
 } input_device_kind;
 
 typedef struct {

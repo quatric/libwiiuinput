@@ -583,11 +583,13 @@ void INPUT_DeviceRumble(int index, bool on)
     case INPUT_DEV_PRO:
         rumble_wpad[d->port] = on;
         break;
-    case INPUT_DEV_GAMECUBE:
+    case INPUT_DEV_GCADAPTER:
         INPUT_GCAdapterRumble(d->port, on);
         break;
     case INPUT_DEV_USBPAD:
         INPUT_HIDPadRumble(d->port, on);
+        break;
+    default:
         break;
     }
     pump_rumble();
@@ -669,7 +671,7 @@ void inpw_pads_update(void)
             gcad_previous[port] = 0;
             continue;
         }
-        feed_gc_like(INPUT_DEV_GAMECUBE, port, "GameCube", &p, &gcad_previous[port]);
+        feed_gc_like(INPUT_DEV_GCADAPTER, port, "GameCube", &p, &gcad_previous[port]);
     }
     for (int port = 0; port < 4; port++) {
         input_gc_pad p;

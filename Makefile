@@ -7,6 +7,10 @@ export WUT_ROOT  ?= $(DEVKITPRO)/wut
 
 include $(WUT_ROOT)/share/wut_rules
 
+# devkitPPC's own archiver: no LTO here, and a gcc-ar elsewhere on the PATH
+# may not find its plugin
+AR      := $(DEVKITPPC)/bin/powerpc-eabi-ar
+
 CFLAGS  := -O2 -Wall -Wextra -ffunction-sections -fdata-sections $(MACHDEP) \
            -D__WIIU__ -D__WUT__ -Iinclude -I$(WUT_ROOT)/include
 
