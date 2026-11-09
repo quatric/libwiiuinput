@@ -1,6 +1,6 @@
 /* HID report descriptor parser.  See libinput_hidparse.h. */
 
-#ifdef HAVE_TABLET
+#if defined(HAVE_TABLET) || defined(HAVE_HIDPADS)
 
 #include <string.h>
 
@@ -360,4 +360,4 @@ bool hidp_find_pen(const hidp_desc *d, hidp_pen *pen)
 	return true;
 }
 
-#endif /* HAVE_TABLET */
+#endif /* HAVE_TABLET || HAVE_HIDPADS */

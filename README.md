@@ -132,8 +132,11 @@ when it is plugged in), then at `/vol/external01/controllers/VVVV_PPPP.ini` (the
 `/vol/external01/controller.ini` on the SD card (every `.ini` in that folder, read once by
 `INPUT_Init`, so the system's HID thread never waits on the card). `INPUT_HIDPadSetLog(printf)`
 also names every USB device the system offers and why it was or was not taken, which is the place to
-look when a pad is not seen: a pad whose VID:PID has no layout needs one on the card. Only a device with a layout is taken, so keyboards
-and mice stay with their drivers. The layouts and report conversion (`source/libinput_hid.c`) are
+look when a pad is not seen. A pad with no layout (or whose reports are shorter than its layout
+needs) is read from its own HID report descriptor instead, as `"generic USB pad"`: X/Y, the right
+stick (Rx/Ry, or else Z/Rz), the hat and buttons 1-16 (1 Y, 2 B, 3 A, 4 X, 5/7 L, 6/8 R, 9 Z, 10/13
+Start; `INPUT_HIDPadRaw(port)` gives them by number). Keyboards, boot mice and tablet makers'
+devices are never taken. The layouts and report conversion (`source/libinput_hid.c`) are
 libwiiinput's, unchanged. Unlike on the Wii, the PlayStation 3's pad works too: it is switched on
 with Nintendont's feature report and polled with GET_REPORT once a frame. Layouts whose reports
 carry several pads (`MultiIn` 2 to 4) are not read.
@@ -171,8 +174,13 @@ long as it is plugged in; `TB_*` then give it as on the Wii, with `wiimote` set.
 `INPUT_RemoteDebug(chan, &r)` gives what the system said about a Wii Remote channel this frame:
 KPAD's error, sample count and extension, WPAD's own extension and data format, the Classic
 Controller's buttons through KPAD and through WPAD, and the ID bytes of an extension the system
-does not know. When WPAD sees a Classic Controller that KPAD does not report, the library reads it
-through WPAD instead. The test program shows all of this, and writes every driver's log to
+does not know. A Classic Controller (Classic, Classic Pro, and the NES / SNES Classic Mini pads) is
+also read straight from its own registers over Bluetooth, as the uDraw is, and that reading wins
+while it is fresh; `classic_from` says which was used (`K`PAD, `W`PAD or `R`egisters).
+
+`INPUT_USBDeviceCount()` / `INPUT_USBDeviceGet(i, &u)` list every USB HID interface the system
+offered: VID:PID, interface, subclass/protocol, report size, what the library made of it, how many
+reports came and were read, and the start of the last one. The test program shows all of this, and writes every driver's log to
 `sd:/padtest.log`.
 
 ### Keyboard and mouse
@@ -206,8 +214,8 @@ git submodule add https://github.com/quatric/libwiiuinput.git libwiiuinput
 
 ## Status
 
-Builds cleanly with wut and the test program links. The Classic Controller fallback, the tablets,
-the uDraw and the USB pads are still to be confirmed on a Wii U.
+Builds cleanly with wut and the test program links. A Wacom Intuos S and the uDraw have been read on
+a Wii U; the Classic Controller register reading and generic USB pads are still to be confirmed.
 
 ## License
 

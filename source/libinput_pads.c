@@ -381,11 +381,10 @@ static bool wpad_classic(int ch, uint32_t *buttons, float st[4], float tr[2])
     WPADStatusClassic cs;
     WPADDataFormat fmt = WPADGetDataFormat((WPADChan)ch);
 
-    if (fmt != WPAD_FMT_CLASSIC && fmt != WPAD_FMT_CLASSIC_ACC && fmt != WPAD_FMT_CLASSIC_ACC_DPD) {
-        /* The system has not switched the report to one with the Classic's bytes. */
-        WPADSetDataFormat((WPADChan)ch, use_pointer ? WPAD_FMT_CLASSIC_ACC_DPD : WPAD_FMT_CLASSIC_ACC);
+    /* Only when the report already carries the Classic's bytes: changing
+     * the format here would fight KPAD, which sets its own. */
+    if (fmt != WPAD_FMT_CLASSIC && fmt != WPAD_FMT_CLASSIC_ACC && fmt != WPAD_FMT_CLASSIC_ACC_DPD)
         return false;
-    }
     memset(&cs, 0, sizeof(cs));
     WPADRead((WPADChan)ch, (WPADStatus *)&cs);
     if (cs.core.error != WPAD_ERROR_NONE)
@@ -457,10 +456,20 @@ static void read_remote(int ch, float dt)
     dbg->classic_kpad = 0;
     dbg->classic_wpad = 0;
     dbg->wpad_classic_used = false;
+    dbg->classic_reg = 0;
+    dbg->classic_from = 0;
 
     if (!c->connected) {
-        c->prev_core = c->prev_ext = 0;
-        return;
+        uint32_t rb;
+        float rst[4], rtr[2];
+        if (dbg->wpad_error != WPAD_ERROR_NONE || !inpw_extreg_classic(ch, &rb, rst, rtr)) {
+            c->prev_core = c->prev_ext = 0;
+            return;
+        }
+        /* KPAD has no sample, but the Classic's registers answer: read it
+         * with an empty core report. */
+        memset(&c->st, 0, sizeof(c->st));
+        c->st.extensionType = probe;
     }
 
     const KPADStatus *s = &c->st;
@@ -507,6 +516,7 @@ static void read_remote(int ch, float dt)
         cl_st[3] = s->classic.rightStick.y;
         cl_tr[0] = clampf(s->classic.leftTrigger, 0, 1);
         cl_tr[1] = clampf(s->classic.rightTrigger, 0, 1);
+        dbg->classic_from = 'K';
     }
     if ((probe == WPAD_EXT_CLASSIC || probe == WPAD_EXT_MPLUS_CLASSIC) && !dbg->udraw) {
         uint32_t wb = 0;
@@ -523,7 +533,23 @@ static void read_remote(int ch, float dt)
                         cl_st[i] = wst[i];
                 cl_tr[0] = wtr[0] > cl_tr[0] ? wtr[0] : cl_tr[0];
                 cl_tr[1] = wtr[1] > cl_tr[1] ? wtr[1] : cl_tr[1];
+                dbg->classic_from = 'W';
             }
+        }
+    }
+    {
+        /* The Classic's own registers, read over Bluetooth as the uDraw's
+         * are: they say what the controller has, whatever the system makes
+         * of it, so they win whenever they are fresh. */
+        uint32_t rb = 0;
+        float rst[4], rtr[2];
+        if (!dbg->udraw && inpw_extreg_classic(ch, &rb, rst, rtr)) {
+            dbg->classic_reg = rb;
+            dbg->classic_from = 'R';
+            classic = true;
+            ext_raw = rb;
+            memcpy(cl_st, rst, sizeof(cl_st));
+            memcpy(cl_tr, rtr, sizeof(cl_tr));
         }
     }
     if (!classic && (s->extensionType == WPAD_EXT_NUNCHUK || s->extensionType == WPAD_EXT_MPLUS_NUNCHUK)) {

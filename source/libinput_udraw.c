@@ -23,7 +23,6 @@
 
 #include "libinput_internal.h"
 
-#ifdef HAVE_TABLET
 #include "input_tablet.h"
 
 #define CHANNELS     4
@@ -38,7 +37,7 @@
 enum { U_NONE, U_ID, U_DATA };
 
 typedef struct {
-    uint8_t b[6];
+    uint8_t b[8];
     uint32_t time;
 } ud_report;
 
@@ -49,11 +48,25 @@ typedef struct {
 
 static const uint8_t udraw_id[6] = { 0xff, 0x00, 0xa4, 0x20, 0x01, 0x12 };
 
+enum { K_NONE, K_UDRAW, K_CLASSIC };
+
+/* A Classic Controller, Classic Controller Pro, or the NES / SNES Classic
+ * Mini pads: a4 20 at 0xFC, type 01 at 0xFF. 0xFE is the data format. */
+static int ext_kind(const uint8_t id[6])
+{
+    if (memcmp(id, udraw_id, 6) == 0)
+        return K_UDRAW;
+    if (id[2] == 0xa4 && id[3] == 0x20 && id[5] == 0x01)
+        return K_CLASSIC;
+    return K_NONE;
+}
+
 static OSSpinLock lock;
 static bool lock_ready;
 static struct {
     volatile int pending;      /* U_ID or U_DATA in flight */
-    volatile bool attached;    /* the ID said uDraw */
+    volatile bool attached;    /* the ID said uDraw or Classic */
+    volatile int kind;         /* K_UDRAW or K_CLASSIC */
     volatile bool id_done;     /* the ID has been read for this extension */
     uint32_t id_failed_at;
     uint8_t ext;               /* the extension type it was read for */
@@ -65,8 +78,6 @@ static struct {
     uint32_t last;
 } ud[CHANNELS];
 
-static ud_track ud_popped[CHANNELS], ud_current[CHANNELS];
-static int32_t ud_min_x = 0x56, ud_max_x = 0x780, ud_min_y = 0x65, ud_max_y = 0x5a5;
 
 static void lock_take(void) { OSUninterruptibleSpinLock_Acquire(&lock); }
 static void lock_give(void) { OSUninterruptibleSpinLock_Release(&lock); }
@@ -81,7 +92,8 @@ static void on_read(WPADChan chan, WPADError status)
         if (status == WPAD_ERROR_NONE) {
             memcpy(ud[chan].id, ud[chan].buf, 6);
             ud[chan].id_done = true;
-            ud[chan].attached = memcmp(ud[chan].buf, udraw_id, 6) == 0;
+            ud[chan].kind = ext_kind(ud[chan].buf);
+            ud[chan].attached = ud[chan].kind != K_NONE;
             if (ud[chan].attached) {
                 ud[chan].head = ud[chan].tail = 0;
                 ud[chan].last = inpw_now_ms();
@@ -90,22 +102,25 @@ static void on_read(WPADChan chan, WPADError status)
             ud[chan].id_failed_at = inpw_now_ms();
         }
     } else if (ud[chan].pending == U_DATA && status == WPAD_ERROR_NONE && ud[chan].attached) {
-        uint32_t next = (ud[chan].head + 1) & RING_MASK;
         uint32_t now = inpw_now_ms();
-        if (next == ud[chan].tail)
-            ud[chan].tail = (ud[chan].tail + 1) & RING_MASK; /* drop the oldest */
-        memcpy(ud[chan].ring[ud[chan].head].b, ud[chan].buf, 6);
-        ud[chan].ring[ud[chan].head].time = now;
-        ud[chan].head = next;
-        memcpy(ud[chan].latest.b, ud[chan].buf, 6);
+        if (ud[chan].kind == K_UDRAW) {
+            uint32_t next = (ud[chan].head + 1) & RING_MASK;
+            if (next == ud[chan].tail)
+                ud[chan].tail = (ud[chan].tail + 1) & RING_MASK; /* drop the oldest */
+            memcpy(ud[chan].ring[ud[chan].head].b, ud[chan].buf, 8);
+            ud[chan].ring[ud[chan].head].time = now;
+            ud[chan].head = next;
+        }
+        memcpy(ud[chan].latest.b, ud[chan].buf, 8);
         ud[chan].latest.time = ud[chan].last = now;
     }
     ud[chan].pending = U_NONE;
     lock_give();
 }
 
-/* Extensions the system reads itself; anything else may be a uDraw (the
- * system may also take one for a Classic Controller). */
+/* Extensions with nothing to read here. A Classic is read: the system's
+ * own reading of it has not been dependable (and a uDraw may be taken for
+ * one). */
 static bool known_ext(uint8_t ext)
 {
     return ext == WPAD_EXT_CORE || ext == WPAD_EXT_NUNCHUK || ext == WPAD_EXT_MPLUS ||
@@ -132,6 +147,7 @@ void inpw_udraw_update(void)
             ud[ch].ext = (uint8_t)ext;
             ud[ch].id_done = false;
             ud[ch].attached = false;
+            ud[ch].kind = K_NONE;
             ud[ch].id_failed_at = 0;
         }
         if (ud[ch].pending == U_NONE) {
@@ -146,7 +162,9 @@ void inpw_udraw_update(void)
 
         if (want == U_NONE)
             continue;
-        if (WPADReadExtReg((WPADChan)ch, ud[ch].buf, 6, WPAD_PERIPHERAL_SPACE_EXTENSION, want == U_ID ? 0xFA : 0x00,
+        /* the ID is six bytes; a Classic in format 3 has eight data bytes */
+        if (WPADReadExtReg((WPADChan)ch, ud[ch].buf, want == U_DATA && ud[ch].kind == K_CLASSIC ? 8 : 6,
+                           WPAD_PERIPHERAL_SPACE_EXTENSION, want == U_ID ? 0xFA : 0x00,
                            on_read) != WPAD_ERROR_NONE) {
             lock_take();
             ud[ch].pending = U_NONE;
@@ -157,14 +175,83 @@ void inpw_udraw_update(void)
     }
 }
 
-static bool fresh(int ch)
+static __attribute__((unused)) bool fresh(int ch)
 {
-    return ud[ch].attached && inpw_now_ms() - ud[ch].last <= STALE_MS;
+    return ud[ch].attached && ud[ch].kind == K_UDRAW && inpw_now_ms() - ud[ch].last <= STALE_MS;
 }
 
 bool inpw_udraw_on(int ch)
 {
-    return ch >= 0 && ch < CHANNELS && ud[ch].attached;
+    return ch >= 0 && ch < CHANNELS && ud[ch].attached && ud[ch].kind == K_UDRAW;
+}
+
+/* Sticks from the Classic's raw units: centre and half-range. */
+static float cl_axis(int v, float centre, float half)
+{
+    float f = ((float)v - centre) / half;
+    return f < -1.0f ? -1.0f : f > 1.0f ? 1.0f : f;
+}
+
+bool inpw_extreg_classic(int ch, uint32_t *buttons, float st[4], float tr[2])
+{
+    uint8_t b[8], fmt;
+    uint16_t bits;
+    uint32_t out = 0;
+
+    if (ch < 0 || ch >= CHANNELS || !lock_ready)
+        return false;
+    lock_take();
+    if (!ud[ch].attached || ud[ch].kind != K_CLASSIC || !ud[ch].last ||
+        inpw_now_ms() - ud[ch].last > STALE_MS) {
+        lock_give();
+        return false;
+    }
+    memcpy(b, ud[ch].latest.b, 8);
+    fmt = ud[ch].id[4];
+    lock_give();
+
+    if (fmt == 3) {
+        /* eight bytes: LX RX LY RY LT RT, then the two button bytes */
+        st[0] = cl_axis(b[0], 128, 100);
+        st[1] = cl_axis(b[2], 128, 100);
+        st[2] = cl_axis(b[1], 128, 100);
+        st[3] = cl_axis(b[3], 128, 100);
+        tr[0] = b[4] / 255.0f;
+        tr[1] = b[5] / 255.0f;
+        bits = (uint16_t)(b[6] << 8 | b[7]);
+    } else {
+        /* six bytes, packed (WiiBrew, "Classic Controller") */
+        int lx = b[0] & 0x3f, ly = b[1] & 0x3f;
+        int rx = (b[0] & 0xc0) >> 3 | (b[1] & 0xc0) >> 5 | (b[2] & 0x80) >> 7;
+        int ry = b[2] & 0x1f;
+        int lt = (b[2] & 0x60) >> 2 | (b[3] & 0xe0) >> 5;
+        int rt = b[3] & 0x1f;
+        st[0] = cl_axis(lx, 32, 25);
+        st[1] = cl_axis(ly, 32, 25);
+        st[2] = cl_axis(rx, 16, 12.5f);
+        st[3] = cl_axis(ry, 16, 12.5f);
+        tr[0] = lt / 31.0f;
+        tr[1] = rt / 31.0f;
+        bits = (uint16_t)(b[4] << 8 | b[5]);
+    }
+    bits = (uint16_t)~bits; /* 0 = pressed */
+    if (bits & 0x8000) out |= WPAD_CLASSIC_BUTTON_RIGHT;
+    if (bits & 0x4000) out |= WPAD_CLASSIC_BUTTON_DOWN;
+    if (bits & 0x2000) out |= WPAD_CLASSIC_BUTTON_L;
+    if (bits & 0x1000) out |= WPAD_CLASSIC_BUTTON_MINUS;
+    if (bits & 0x0800) out |= WPAD_CLASSIC_BUTTON_HOME;
+    if (bits & 0x0400) out |= WPAD_CLASSIC_BUTTON_PLUS;
+    if (bits & 0x0200) out |= WPAD_CLASSIC_BUTTON_R;
+    if (bits & 0x0080) out |= WPAD_CLASSIC_BUTTON_ZL;
+    if (bits & 0x0040) out |= WPAD_CLASSIC_BUTTON_B;
+    if (bits & 0x0020) out |= WPAD_CLASSIC_BUTTON_Y;
+    if (bits & 0x0010) out |= WPAD_CLASSIC_BUTTON_A;
+    if (bits & 0x0008) out |= WPAD_CLASSIC_BUTTON_X;
+    if (bits & 0x0004) out |= WPAD_CLASSIC_BUTTON_ZR;
+    if (bits & 0x0002) out |= WPAD_CLASSIC_BUTTON_LEFT;
+    if (bits & 0x0001) out |= WPAD_CLASSIC_BUTTON_UP;
+    *buttons = out;
+    return true;
 }
 
 void inpw_udraw_debug(int ch, uint8_t *ext, uint8_t id[6], bool *id_read)
@@ -175,6 +262,11 @@ void inpw_udraw_debug(int ch, uint8_t *ext, uint8_t id[6], bool *id_read)
     *id_read = ud[ch].id_done;
     memcpy(id, ud[ch].id, 6);
 }
+
+#ifdef HAVE_TABLET
+
+static ud_track ud_popped[CHANNELS], ud_current[CHANNELS];
+static int32_t ud_min_x = 0x56, ud_max_x = 0x780, ud_min_y = 0x65, ud_max_y = 0x5a5;
 
 static bool decode(int chan, const ud_report *r, ud_track *t, tb_sample *s)
 {
@@ -298,18 +390,6 @@ void TB_UDrawSetArea(int32_t min_x, int32_t max_x, int32_t min_y, int32_t max_y)
     ud_max_x = max_x;
     ud_min_y = min_y;
     ud_max_y = max_y;
-}
-
-#else /* !HAVE_TABLET */
-
-void inpw_udraw_update(void) {}
-bool inpw_udraw_on(int ch) { (void)ch; return false; }
-void inpw_udraw_debug(int ch, uint8_t *ext, uint8_t id[6], bool *id_read)
-{
-    (void)ch;
-    *ext = 0;
-    memset(id, 0, 6);
-    *id_read = false;
 }
 
 #endif /* HAVE_TABLET */

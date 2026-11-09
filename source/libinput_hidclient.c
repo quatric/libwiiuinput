@@ -28,6 +28,7 @@
 #include <nsyshid/hid.h>
 
 #include "libinput_hid.h"
+#include "libinput_hidparse.h"
 #include "libinput_internal.h"
 
 #define MAX_SLOTS 8
@@ -49,7 +50,28 @@
 #define HID_REPORT_OUTPUT 2
 #define HID_REPORT_FEATURE 3
 
-enum { K_NONE, K_MOUSE, K_GCAD, K_PAD };
+enum { K_NONE, K_MOUSE, K_GCAD, K_PAD, K_PROBE };
+
+#define HID_DT_REPORT 0x22
+#define RDESC_BYTES 1024
+
+#ifdef HAVE_HIDPADS
+/* A pad with no controller.ini layout, read from its own report
+ * descriptor: the fields of a joystick or gamepad collection. */
+enum { G_X, G_Y, G_RX, G_RY, G_LT, G_RT, G_AXES };
+#define G_BUTTONS 16
+typedef struct {
+    uint8_t report_id;
+    bool uses_ids;
+    uint16_t report_bytes;      /* with the ID byte */
+    hidp_field axis[G_AXES];
+    bool has_axis[G_AXES];
+    hidp_field hat;
+    bool has_hat;
+    hidp_field button[G_BUTTONS];
+    uint16_t has_button;        /* bit n: button n + 1 */
+} generic_map;
+#endif
 
 typedef struct {
     int kind;
@@ -76,13 +98,25 @@ typedef struct {
     int port;
     const char *where;
     hidpad_mapping map;
+    bool generic;
+    generic_map gmap;
+    uint16_t gen_raw;           /* a generic pad's buttons as numbered, bit n = button n + 1 */
     hidpad_state state;
     bool state_valid;
     bool can_rumble;
     uint8_t rumble_sent, rumble_flight, rumble_index;
     bool rumble_active;
 #endif
+    uint8_t *desc;              /* report descriptor, while probing */
+    uint16_t max_rx;
+    uint8_t subclass, protocol;
 } slot_t;
+
+/* Every HID interface offered, and what was done with it. */
+#define MAX_SEEN 16
+static input_usb_device seen[MAX_SEEN];
+static uint32_t seen_handle[MAX_SEEN];
+static int seen_count;
 
 static OSSpinLock lock;
 static slot_t slots[MAX_SLOTS];
@@ -136,6 +170,79 @@ static slot_t *slot_of(void *ctx, uint32_t handle)
 }
 
 static void arm_read(int idx);
+
+/* Notes what became of an interface; the caller holds `lock`. */
+static void seen_set(HIDDevice *d, uint32_t handle, const char *what)
+{
+    int i;
+
+    for (i = 0; i < seen_count; i++)
+        if (seen_handle[i] == handle)
+            break;
+    if (i == seen_count) {
+        if (!d)
+            return;
+        if (seen_count == MAX_SEEN) {
+            memmove(&seen[0], &seen[1], sizeof(seen[0]) * (MAX_SEEN - 1));
+            memmove(&seen_handle[0], &seen_handle[1], sizeof(seen_handle[0]) * (MAX_SEEN - 1));
+            i = MAX_SEEN - 1;
+        } else {
+            seen_count++;
+        }
+        memset(&seen[i], 0, sizeof(seen[i]));
+        seen_handle[i] = handle;
+    }
+    if (d) {
+        seen[i].vid = d->vid;
+        seen[i].pid = d->pid;
+        seen[i].interface = d->interfaceIndex;
+        seen[i].subclass = d->subClass;
+        seen[i].protocol = d->protocol;
+        seen[i].max_rx = d->maxPacketSizeRx;
+    }
+    snprintf(seen[i].what, sizeof(seen[i].what), "%s", what);
+}
+
+static void seen_note(HIDDevice *d, const char *what)
+{
+    lock_take();
+    seen_set(d, d->handle, what);
+    lock_give();
+}
+
+static void seen_count_report(uint32_t handle, uint32_t bytes, const uint8_t *data, bool used)
+{
+    for (int i = 0; i < seen_count; i++) {
+        if (seen_handle[i] != handle)
+            continue;
+        seen[i].reports++;
+        if (used)
+            seen[i].decoded++;
+        seen[i].last_len = (uint8_t)(bytes > 255 ? 255 : bytes);
+        memcpy(seen[i].last, data, bytes < sizeof(seen[i].last) ? bytes : sizeof(seen[i].last));
+        return;
+    }
+}
+
+int INPUT_USBDeviceCount(void)
+{
+    return seen_count;
+}
+
+bool INPUT_USBDeviceGet(int index, input_usb_device *out)
+{
+    bool ok = false;
+
+    if (!client_added || index < 0 || !out)
+        return false;
+    lock_take();
+    if (index < seen_count) {
+        *out = seen[index];
+        ok = true;
+    }
+    lock_give();
+    return ok;
+}
 
 /* ---- Layouts for USB pads ------------------------------------------------ */
 
@@ -248,6 +355,158 @@ static bool find_layout(uint32_t id, hidpad_mapping *out, const char **name)
 bool INPUT_HIDPadAddConfig(const char *text, size_t length) { (void)text; (void)length; return false; }
 #endif
 
+/* ---- Generic pads ------------------------------------------------------- */
+
+#ifdef HAVE_HIDPADS
+#define GD(u) (0x00010000u | (u))
+
+static hidp_desc gdesc; /* only the HID thread parses */
+
+static bool is_pad_app(uint32_t app)
+{
+    return app == GD(0x04) || app == GD(0x05) || app == GD(0x08); /* joystick, gamepad, multi-axis */
+}
+
+static const hidp_field *gfind(const hidp_desc *d, uint32_t usage, int report_id)
+{
+    for (int i = 0; i < d->nfields; i++) {
+        const hidp_field *f = &d->fields[i];
+        if (f->type == HIDP_INPUT && f->usage == usage && is_pad_app(f->app) &&
+            (report_id < 0 || f->report_id == report_id) && f->logical_max > f->logical_min)
+            return f;
+    }
+    return NULL;
+}
+
+/* The pad's fields from its descriptor; false when it describes no pad. */
+static bool generic_build(const hidp_desc *d, generic_map *g, char *summary, size_t n)
+{
+    const hidp_field *f;
+    int id = -1, nb = 0;
+    uint32_t right_x = GD(0x32), right_y = GD(0x35), lt = 0, rt = 0;
+
+    memset(g, 0, sizeof(*g));
+    /* the report carrying X, or else the first button */
+    f = gfind(d, GD(0x30), -1);
+    for (int i = 0; !f && i < d->nfields; i++)
+        if (d->fields[i].type == HIDP_INPUT && is_pad_app(d->fields[i].app) && (d->fields[i].usage >> 16) == HIDP_PAGE_BUTTON)
+            f = &d->fields[i];
+    if (!f)
+        return false;
+    id = f->report_id;
+    g->report_id = (uint8_t)id;
+    g->uses_ids = d->uses_ids;
+    g->report_bytes = (uint16_t)hidp_report_bytes(d, HIDP_INPUT, (uint8_t)id);
+
+    /* Rx and Ry are the right stick where there are both (then Z and Rz
+     * are triggers); otherwise Z and Rz are, as on most DirectInput pads. */
+    if (gfind(d, GD(0x33), id) && gfind(d, GD(0x34), id)) {
+        right_x = GD(0x33);
+        right_y = GD(0x34);
+        lt = GD(0x32);
+        rt = GD(0x35);
+    }
+    const uint32_t want[G_AXES] = { GD(0x30), GD(0x31), right_x, right_y, lt, rt };
+    for (int a = 0; a < G_AXES; a++) {
+        if (want[a] && (f = gfind(d, want[a], id))) {
+            g->axis[a] = *f;
+            g->has_axis[a] = true;
+        }
+    }
+    if ((f = gfind(d, GD(0x39), id))) {
+        g->hat = *f;
+        g->has_hat = true;
+    }
+    for (int b = 0; b < G_BUTTONS; b++) {
+        if ((f = gfind(d, ((uint32_t)HIDP_PAGE_BUTTON << 16) | (uint32_t)(b + 1), id))) {
+            g->button[b] = *f;
+            g->has_button |= (uint16_t)(1u << b);
+            nb++;
+        }
+    }
+    if (!g->has_axis[G_X] && !g->has_hat && nb < 4)
+        return false;
+    snprintf(summary, n, "report %u, %u bytes, %s%s%s%d buttons", (unsigned)id, (unsigned)g->report_bytes,
+             g->has_axis[G_X] ? "stick " : "", g->has_axis[G_RX] ? "right stick " : "", g->has_hat ? "hat " : "", nb);
+    return true;
+}
+
+static int8_t g_axis(const hidp_field *f, const uint8_t *data, uint32_t len, bool flip)
+{
+    float lo = (float)f->logical_min, hi = (float)f->logical_max;
+    float v = ((float)hidp_get(f, data, len) - (lo + hi) * 0.5f) / ((hi - lo) * 0.5f) * 127.0f;
+    if (flip)
+        v = -v;
+    if (v > 127.0f) v = 127.0f;
+    if (v < -127.0f) v = -127.0f;
+    return (int8_t)v;
+}
+
+static uint8_t g_trigger(const hidp_field *f, const uint8_t *data, uint32_t len)
+{
+    int32_t v = hidp_get(f, data, len) - f->logical_min;
+    int32_t r = f->logical_max - f->logical_min;
+    v = v * 255 / r;
+    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
+/* Buttons by number, as most PC pads and adapters for Nintendo pads number
+ * them; the raw numbers are kept too (INPUT_HIDPadRaw). */
+static const uint16_t g_button_map[G_BUTTONS] = {
+    HIDPAD_PAD_Y, HIDPAD_PAD_B, HIDPAD_PAD_A, HIDPAD_PAD_X,   /* 1-4: the face, left, bottom, right, top */
+    HIDPAD_PAD_L, HIDPAD_PAD_R, HIDPAD_PAD_L, HIDPAD_PAD_R,   /* 5-8: shoulders, then ZL / ZR */
+    HIDPAD_PAD_Z, HIDPAD_PAD_START, 0, 0,                     /* 9: select / minus, 10: start / plus */
+    HIDPAD_PAD_START, 0, 0, 0                                 /* 13: home */
+};
+
+static bool generic_decode(const generic_map *g, const uint8_t *rep, uint32_t bytes, hidpad_state *out, uint16_t *raw)
+{
+    const uint8_t *data = rep;
+    uint32_t len = bytes;
+    uint16_t buttons = 0, nums = 0;
+
+    if (g->uses_ids) {
+        if (!bytes || rep[0] != g->report_id)
+            return false;
+        data++;
+        len--;
+    }
+    if (!len)
+        return false;
+    memset(out, 0, sizeof(*out));
+    for (int b = 0; b < G_BUTTONS; b++) {
+        if ((g->has_button & (1u << b)) && hidp_get(&g->button[b], data, len) > g->button[b].logical_min) {
+            nums |= (uint16_t)(1u << b);
+            buttons |= g_button_map[b];
+        }
+    }
+    if (g->has_hat) {
+        int32_t v = hidp_get(&g->hat, data, len) - g->hat.logical_min;
+        static const uint16_t dirs[8] = {
+            HIDPAD_PAD_UP, HIDPAD_PAD_UP | HIDPAD_PAD_RIGHT, HIDPAD_PAD_RIGHT, HIDPAD_PAD_DOWN | HIDPAD_PAD_RIGHT,
+            HIDPAD_PAD_DOWN, HIDPAD_PAD_DOWN | HIDPAD_PAD_LEFT, HIDPAD_PAD_LEFT, HIDPAD_PAD_UP | HIDPAD_PAD_LEFT
+        };
+        /* four-way hats count 0-3 */
+        if (g->hat.logical_max - g->hat.logical_min == 3 && v >= 0 && v < 4)
+            v *= 2;
+        if (v >= 0 && v < 8)
+            buttons |= dirs[v];
+    }
+    if (g->has_axis[G_X]) out->stick_x = g_axis(&g->axis[G_X], data, len, false);
+    if (g->has_axis[G_Y]) out->stick_y = g_axis(&g->axis[G_Y], data, len, true);
+    if (g->has_axis[G_RX]) out->substick_x = g_axis(&g->axis[G_RX], data, len, false);
+    if (g->has_axis[G_RY]) out->substick_y = g_axis(&g->axis[G_RY], data, len, true);
+    if (g->has_axis[G_LT]) out->trigger_l = g_trigger(&g->axis[G_LT], data, len);
+    if (g->has_axis[G_RT]) out->trigger_r = g_trigger(&g->axis[G_RT], data, len);
+    if (nums & (1u << 6)) out->trigger_l = 255;
+    if (nums & (1u << 7)) out->trigger_r = 255;
+    out->buttons = buttons;
+    out->no_rumble = 1;
+    *raw = nums;
+    return true;
+}
+#endif
+
 /* ---- Callbacks ------------------------------------------------------------ */
 
 static void on_read(uint32_t handle, int32_t error, uint8_t *buffer, uint32_t bytes, void *ctx)
@@ -264,12 +523,14 @@ static void on_read(uint32_t handle, int32_t error, uint8_t *buffer, uint32_t by
         if (error < 0) {
             again = ++s->fails < FAILS_MAX;
         } else {
+            bool used = false;
             s->fails = 0;
             again = true;
             switch (s->kind) {
             case K_MOUSE:
                 if (bytes >= 3) {
                     uint8_t b = s->rx[0] & 7;
+                    used = true;
                     m_quick |= b & ~s->mbuttons;
                     s->mbuttons = b;
                     m_dx += (int8_t)s->rx[1];
@@ -284,25 +545,33 @@ static void on_read(uint32_t handle, int32_t error, uint8_t *buffer, uint32_t by
                     memcpy(s->raw, s->rx + 1, sizeof(s->raw));
                     s->report_ms = inpw_now_ms();
                     s->reporting = true;
+                    used = true;
                 }
                 break;
 #ifdef HAVE_HIDPADS
             case K_PAD: {
                 hidpad_state st;
+                bool ok;
                 /* A report of another kind, or too short, is skipped. */
-                if (hidpad_decode(&s->map, s->rx, bytes ? bytes : s->rx_size, &st)) {
+                if (s->generic)
+                    ok = generic_decode(&s->gmap, s->rx, bytes ? bytes : s->rx_size, &st, &s->gen_raw);
+                else
+                    ok = hidpad_decode(&s->map, s->rx, bytes ? bytes : s->rx_size, &st);
+                used = ok;
+                if (ok) {
                     if (!s->can_rumble)
                         st.no_rumble = 1;
                     s->state = st;
                     s->state_valid = true;
                 }
                 /* GET_REPORT pads are polled from the main thread, once a frame. */
-                if (!s->map.polltype)
+                if (!s->generic && !s->map.polltype)
                     again = false;
                 break;
             }
 #endif
             }
+            seen_count_report(handle, bytes ? bytes : s->rx_size, s->rx, used);
         }
         if (!again && error < 0 && s->kind == K_MOUSE)
             s->mbuttons = 0;
@@ -411,12 +680,16 @@ static bool have_kind(int kind)
 static slot_t *take_slot(int idx, int kind, HIDDevice *d)
 {
     slot_t *s = &slots[idx];
-    uint8_t *rx = s->rx, *tx = s->tx;
+    uint8_t *rx = s->rx, *tx = s->tx, *desc = s->desc;
     uint32_t gen = s->gen + 1;
 
     memset(s, 0, sizeof(*s));
     s->rx = rx;
     s->tx = tx;
+    s->desc = desc;
+    s->max_rx = d->maxPacketSizeRx;
+    s->subclass = d->subClass;
+    s->protocol = d->protocol;
     s->gen = gen & 0x0FFFFFFF;
     s->kind = kind;
     s->handle = d->handle;
@@ -474,6 +747,94 @@ static int32_t attach_gcad(HIDDevice *d, int idx)
 }
 
 #ifdef HAVE_HIDPADS
+static int free_port(void)
+{
+    bool used[MAX_PADS] = { false };
+
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (slots[i].kind == K_PAD)
+            used[slots[i].port] = true;
+    for (int i = 0; i < MAX_PADS; i++)
+        if (!used[i])
+            return i;
+    return -1;
+}
+
+/* The report descriptor of a device with no layout has come. */
+static void on_gen_desc(uint32_t handle, int32_t error, uint8_t *buffer, uint32_t bytes, void *ctx)
+{
+    static generic_map g;  /* only the HID thread builds */
+    int idx = (int)((uintptr_t)ctx & 0xF);
+    char summary[96] = "";
+    bool pad = false, go = false;
+    slot_t *s;
+    int port = -1;
+
+    (void)buffer;
+    lock_take();
+    s = slot_of(ctx, handle);
+    lock_give();
+    if (!s || s->kind != K_PROBE)
+        return;
+    if (error >= 0 && bytes > 0 && hidp_parse(s->desc, bytes > RDESC_BYTES ? RDESC_BYTES : bytes, &gdesc))
+        pad = generic_build(&gdesc, &g, summary, sizeof(summary));
+
+    lock_take();
+    if (slot_of(ctx, handle) == s && s->kind == K_PROBE) {
+        port = pad ? free_port() : -1;
+        if (port >= 0) {
+            s->kind = K_PAD;
+            s->generic = true;
+            s->gmap = g;
+            s->port = port;
+            s->where = "generic USB pad";
+            s->can_rumble = false;
+            s->rumble_sent = 0;
+            pad_rumble_want[port] = false;
+            if (g.report_bytes > s->rx_size)
+                s->rx_size = g.report_bytes <= BUF_BYTES ? g.report_bytes : BUF_BYTES;
+            go = true;
+            seen_set(NULL, handle, "generic pad");
+        } else {
+            s->kind = K_NONE;
+            seen_set(NULL, handle, error < 0 ? "no report descriptor" : pad ? "pad, but four already" : "not a pad");
+        }
+    }
+    lock_give();
+    PLOG("USB %04x:%04x if %u: %s%s%s\n", s->vid, s->pid, s->iface,
+         error < 0 ? "no report descriptor" : !pad ? "descriptor describes no pad" : go ? "generic pad: " : "four pads already",
+         go ? summary : "", "");
+    if (go) {
+        PLOG("USB pad %04x:%04x: port %d (from its descriptor)\n", s->vid, s->pid, port + 1);
+        arm_read(idx);
+    }
+}
+
+/* No layout: ask the device for its report descriptor (answered in on_gen_desc). */
+static int32_t probe_generic(HIDDevice *d, int idx)
+{
+    slot_t *s;
+    void *ctx;
+
+    if (!slots[idx].desc)
+        return UNCLAIMED;
+    lock_take();
+    s = take_slot(idx, K_PROBE, d);
+    ctx = ctx_of(idx, s->gen);
+    seen_set(d, d->handle, "asking for its descriptor");
+    lock_give();
+    memset(s->desc, 0, RDESC_BYTES);
+    if (HIDGetDescriptor(d->handle, HID_DT_REPORT, 0, d->interfaceIndex, s->desc, RDESC_BYTES, on_gen_desc, ctx) < 0) {
+        lock_take();
+        s->kind = K_NONE;
+        seen_set(d, d->handle, "descriptor request failed");
+        lock_give();
+        PLOG("USB %04x:%04x if %u: the descriptor could not be asked for\n", d->vid, d->pid, d->interfaceIndex);
+        return UNCLAIMED;
+    }
+    return CLAIMED;
+}
+
 static int32_t attach_pad(HIDDevice *d, int idx)
 {
     static hidpad_mapping map;  /* only the HID thread attaches */
@@ -485,15 +846,16 @@ static int32_t attach_pad(HIDDevice *d, int idx)
     void *ctx;
 
     if (!find_layout(id, &map, &where)) {
-        if (!(d->subClass == 1 && d->protocol == 2)) /* a mouse is said below */
-            PLOG("USB %04x:%04x if %u (%u/%u, %u bytes): no layout, left alone\n", d->vid, d->pid, d->interfaceIndex,
-             d->subClass, d->protocol, d->maxPacketSizeRx);
-        return UNCLAIMED;
+        if (d->subClass == 1 && d->protocol == 2) /* a boot mouse: the mouse driver's */
+            return UNCLAIMED;
+        PLOG("USB %04x:%04x if %u (%u/%u, %u bytes): no layout, reading its descriptor\n", d->vid, d->pid,
+             d->interfaceIndex, d->subClass, d->protocol, d->maxPacketSizeRx);
+        return probe_generic(d, idx);
     }
     if (map.polltype && d->maxPacketSizeRx < map.report_bytes) {
-        PLOG("USB pad %04x:%04x: interface %u sends %u byte reports, the layout needs %u: left alone\n", d->vid,
-             d->pid, d->interfaceIndex, d->maxPacketSizeRx, map.report_bytes);
-        return UNCLAIMED;
+        PLOG("USB pad %04x:%04x: interface %u sends %u byte reports, the layout needs %u: reading its descriptor\n",
+             d->vid, d->pid, d->interfaceIndex, d->maxPacketSizeRx, map.report_bytes);
+        return probe_generic(d, idx);
     }
 
     lock_take();
@@ -506,6 +868,7 @@ static int32_t attach_pad(HIDDevice *d, int idx)
             lock_give();
             PLOG("USB %04x:%04x if %u: another interface of a pad already read\n", d->vid, d->pid,
                  d->interfaceIndex);
+            seen_note(d, "pad's other interface");
             return UNCLAIMED;
         }
     }
@@ -520,6 +883,7 @@ static int32_t attach_pad(HIDDevice *d, int idx)
     s = take_slot(idx, K_PAD, d);
     s->port = port;
     s->where = where;
+    seen_set(d, d->handle, where);
     s->map = map;
     if (!map.polltype && s->rx_size < map.report_bytes)
         s->rx_size = map.report_bytes <= BUF_BYTES ? map.report_bytes : BUF_BYTES;
@@ -575,6 +939,7 @@ static int32_t on_attach(HIDClient *c, HIDDevice *d, HIDAttachEvent event)
             s->kind = K_NONE;
             s->gen = (s->gen + 1) & 0x0FFFFFFF;
         }
+        seen_set(NULL, d->handle, "unplugged");
         lock_give();
         if (kind == K_GCAD)
             GLOG("GC adapter: unplugged\n");
@@ -586,25 +951,30 @@ static int32_t on_attach(HIDClient *c, HIDDevice *d, HIDAttachEvent event)
     /* Keyboards belong to the keyboard library, tablets to the tablet driver. */
     if (d->subClass == 1 && d->protocol == 1) {
         PLOG("USB %04x:%04x if %u: keyboard\n", d->vid, d->pid, d->interfaceIndex);
+        seen_note(d, "keyboard");
         return UNCLAIMED;
     }
     if (inpw_tablet_vendor(d->vid)) {
         PLOG("USB %04x:%04x if %u: a tablet maker's, left to the tablet driver\n", d->vid, d->pid,
              d->interfaceIndex);
+        seen_note(d, "tablet driver's");
         return UNCLAIMED;
     }
 
     lock_take();
     idx = free_slot();
     lock_give();
-    if (idx < 0)
+    if (idx < 0) {
+        seen_note(d, "no free slot");
         return UNCLAIMED;
+    }
 
     if (want_gcad && d->vid == GCAD_VID && d->pid == GCAD_PID) {
         bool taken;
         lock_take();
         taken = have_kind(K_GCAD);
         lock_give();
+        seen_note(d, taken ? "second GC adapter" : "GC adapter");
         return taken ? UNCLAIMED : attach_gcad(d, idx);
     }
 #ifdef HAVE_HIDPADS
@@ -617,8 +987,10 @@ static int32_t on_attach(HIDClient *c, HIDDevice *d, HIDAttachEvent event)
 #endif
     if (want_mouse && d->subClass == 1 && d->protocol == 2) {
         PLOG("USB %04x:%04x if %u: mouse\n", d->vid, d->pid, d->interfaceIndex);
+        seen_note(d, "mouse");
         return attach_mouse(d, idx);
     }
+    seen_note(d, want_pads ? "left alone" : "left alone (pads off)");
     return UNCLAIMED;
 }
 
@@ -654,12 +1026,15 @@ int32_t inpw_hid_init(bool mouse, bool gcadapter, bool hidpads)
             slots[i].rx = memalign(0x40, BUF_BYTES);
         if (!slots[i].tx)
             slots[i].tx = memalign(0x40, BUF_BYTES);
+        if (!slots[i].desc)
+            slots[i].desc = memalign(0x40, RDESC_BYTES); /* without it, no generic pads */
         if (!slots[i].rx || !slots[i].tx)
             return -1;
         slots[i].kind = K_NONE;
         slots[i].gen = gen;
     }
     memset(gcad_rumble_want, 0, sizeof(gcad_rumble_want));
+    seen_count = 0;
     memset(&client, 0, sizeof(client));
 #ifdef HAVE_HIDPADS
     if (want_pads)
@@ -725,7 +1100,8 @@ void inpw_hid_shutdown(void)
     for (int i = 0; i < MAX_SLOTS; i++) {
         free(slots[i].rx);
         free(slots[i].tx);
-        slots[i].rx = slots[i].tx = NULL;
+        free(slots[i].desc);
+        slots[i].rx = slots[i].tx = slots[i].desc = NULL;
     }
 }
 
@@ -790,7 +1166,7 @@ static void poll_pad(int idx)
     void *ctx;
 
     lock_take();
-    if (s->kind != K_PAD || s->map.polltype || s->rx_busy || s->tx_busy || s->fails >= FAILS_MAX) {
+    if (s->kind != K_PAD || s->generic || s->map.polltype || s->rx_busy || s->tx_busy || s->fails >= FAILS_MAX) {
         lock_give();
         return;
     }
@@ -1107,6 +1483,21 @@ const char *INPUT_HIDPadName(int port)
     return name;
 }
 
+uint16_t INPUT_HIDPadRaw(int port)
+{
+    uint16_t raw = 0;
+    slot_t *s;
+
+    if (!client_added || port < 0 || port >= MAX_PADS)
+        return 0;
+    lock_take();
+    s = pad_slot(port);
+    if (s && s->generic)
+        raw = s->gen_raw;
+    lock_give();
+    return raw;
+}
+
 void INPUT_HIDPadRumble(int port, bool on)
 {
     if (port >= 0 && port < MAX_PADS)
@@ -1116,5 +1507,6 @@ void INPUT_HIDPadRumble(int port, bool on)
 bool        INPUT_HIDPadConnected(void) { return false; }
 bool        INPUT_HIDPadPad(int port, input_gc_pad *out) { (void)port; (void)out; return false; }
 const char *INPUT_HIDPadName(int port) { (void)port; return NULL; }
+uint16_t    INPUT_HIDPadRaw(int port) { (void)port; return 0; }
 void        INPUT_HIDPadRumble(int port, bool on) { (void)port; (void)on; }
 #endif

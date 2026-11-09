@@ -175,6 +175,8 @@ typedef struct {
     uint32_t classic_kpad;    /* Classic buttons through KPAD */
     uint32_t classic_wpad;    /* Classic buttons through WPADRead */
     bool     wpad_classic_used; /* KPAD gave nothing, WPAD's reading was used */
+    uint32_t classic_reg;     /* Classic buttons read from the extension's own registers */
+    char     classic_from;    /* where the Classic was read from: 'K'PAD, 'W'PAD, 'R'egisters, or 0 */
     bool     udraw;           /* a uDraw is being read on this channel */
     uint8_t  udraw_ext;       /* the extension type the uDraw check last saw */
     uint8_t  ext_id[6];       /* the extension's ID bytes, when read (unknown extensions only) */
@@ -252,16 +254,38 @@ bool INPUT_GCAdapterPad(int port, input_gc_pad *out);
 void INPUT_GCAdapterRumble(int port, bool on);
 void INPUT_GCAdapterSetLog(int (*print)(const char *fmt, ...));
 
-/* ---- USB game controllers with a Nintendont layout ----
- * About forty built in, and any other given as fs:/vol/external01/
- * controllers/VVVV_PPPP.ini, fs:/vol/external01/controller.ini (with the SD
- * card mounted, as WHB and the wut devoptab do) or to INPUT_HIDPadAddConfig. */
+/* ---- USB game controllers ----
+ * With a Nintendont layout: about forty built in, and any other given as
+ * fs:/vol/external01/controllers/VVVV_PPPP.ini, fs:/vol/external01/
+ * controller.ini (with the SD card mounted, as WHB and the wut devoptab do)
+ * or to INPUT_HIDPadAddConfig. Any other pad or joystick is read from its
+ * own HID report descriptor (name "generic USB pad"): sticks, hat and
+ * buttons 1-16, taken as 1 Y, 2 B, 3 A, 4 X, 5/7 L, 6/8 R, 9 Z, 10/13
+ * Start. A layout file still wins where the numbering differs. */
 bool        INPUT_HIDPadConnected(void);
 bool        INPUT_HIDPadPad(int port, input_gc_pad *out);
 const char *INPUT_HIDPadName(int port);
+/* A generic pad's buttons by number: bit n is button n + 1. */
+uint16_t    INPUT_HIDPadRaw(int port);
 void        INPUT_HIDPadRumble(int port, bool on);
 bool        INPUT_HIDPadAddConfig(const char *text, size_t length);
 void        INPUT_HIDPadSetLog(int (*print)(const char *fmt, ...));
+
+/* ---- Every USB HID interface the system has offered ----
+ * With what was made of it, for finding out why a device is not read. */
+typedef struct {
+    uint16_t vid, pid;
+    uint8_t  interface, subclass, protocol;
+    uint16_t max_rx;          /* the interface's largest report */
+    char     what[32];        /* "mouse", "generic pad", "not a pad", "unplugged", a layout's name... */
+    uint32_t reports;         /* reports received */
+    uint32_t decoded;         /* of those, the ones that were read */
+    uint8_t  last_len;
+    uint8_t  last[16];        /* the start of the last report */
+} input_usb_device;
+
+int  INPUT_USBDeviceCount(void);
+bool INPUT_USBDeviceGet(int index, input_usb_device *out);
 
 /* ---- Mouse (USB, HID boot protocol) ---- */
 bool    INPUT_MouseConnected(void);

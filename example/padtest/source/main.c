@@ -205,6 +205,41 @@ static void save_log(void)
     fclose(f);
 }
 
+/* One USB HID interface and what the library made of it. */
+static void usb_line(const input_usb_device *u, char *out, size_t size)
+{
+    size_t at = (size_t)snprintf(out, size, "USB %04x:%04x if%u %u/%u %2uB %-18.18s rep %lu/%lu", u->vid, u->pid,
+                                 u->interface, u->subclass, u->protocol, u->max_rx, u->what,
+                                 (unsigned long)u->decoded, (unsigned long)u->reports);
+    for (int i = 0; i < u->last_len && i < 12 && at + 4 < size; i++)
+        at += (size_t)snprintf(out + at, size - at, "%s%02x", i ? " " : " | ", u->last[i]);
+}
+
+/* The USB table into the log whenever an entry appears or changes what it is. */
+static void log_usb(void)
+{
+    static char said[16][32];
+    static uint16_t said_id[16][2];
+    static bool said_reports[16];
+    int n = INPUT_USBDeviceCount();
+
+    for (int i = 0; i < n && i < 16; i++) {
+        input_usb_device u;
+        char line[112];
+        if (!INPUT_USBDeviceGet(i, &u))
+            continue;
+        if (!strcmp(said[i], u.what) && said_id[i][0] == u.vid && said_id[i][1] == u.pid &&
+            said_reports[i] == (u.reports > 0))
+            continue;
+        snprintf(said[i], sizeof(said[i]), "%s", u.what);
+        said_id[i][0] = u.vid;
+        said_id[i][1] = u.pid;
+        said_reports[i] = u.reports > 0;
+        usb_line(&u, line, sizeof(line));
+        log_print("%s\n", line);
+    }
+}
+
 /* Where the pen touched, newest last, in TV coordinates. */
 #define TRAIL 1024
 static struct { int16_t x, y; uint8_t size; } trail[TRAIL];
@@ -306,10 +341,10 @@ static void draw(void)
         if (r.ext_id_read)
             snprintf(id, sizeof(id), " id %02x%02x%02x%02x%02x%02x", r.ext_id[0], r.ext_id[1], r.ext_id[2],
                      r.ext_id[3], r.ext_id[4], r.ext_id[5]);
-        text(10 + ch, 0, "Remote %d KPAD err %d n %d ext %02x | WPAD err %d ext %02x fmt %02x | cl %04x/%04x%s%s%s",
+        text(10 + ch, 0, "Remote %d KPAD %d n%d ext %02x | WPAD %d ext %02x fmt %02x | cl K%04x W%04x R%04x %c%s%s",
              ch + 1, r.kpad_error, r.kpad_samples, r.kpad_ext & 0xFF, r.wpad_error, r.wpad_ext & 0xFF, r.format & 0xFF,
-             (unsigned)r.classic_kpad, (unsigned)r.classic_wpad, r.wpad_classic_used ? " (WPAD)" : "",
-             r.udraw ? " uDraw" : "", id);
+             (unsigned)r.classic_kpad, (unsigned)r.classic_wpad, (unsigned)r.classic_reg,
+             r.classic_from ? r.classic_from : '-', r.udraw ? " uDraw" : "", id);
     }
 
     int n = INPUT_DeviceCount();
@@ -330,10 +365,23 @@ static void draw(void)
         if (d.pointer)
             mark((int)d.px, (int)d.py, 10, d.kind == INPUT_DEV_GAMEPAD ? C_HELD : C_IR);
     }
+    /* The last rows take turns: the USB devices, then the log, 4 s each. */
     row = 21;
-    uint32_t end = log_count, first = end > LOG_SHOWN ? end - LOG_SHOWN : 0;
-    for (uint32_t i = first; i < end; i++)
-        text(row++, 0, "log: %.90s", log_lines[i % LOG_LINES]);
+    int nusb = INPUT_USBDeviceCount();
+    if (nusb > 0 && (OSTicksToMilliseconds(OSGetSystemTime()) / 4000) % 2 == 0) {
+        char line[112];
+        for (int i = 0; i < nusb && row < 27; i++) {
+            input_usb_device u;
+            if (INPUT_USBDeviceGet(i, &u)) {
+                usb_line(&u, line, sizeof(line));
+                text(row++, 0, "%s", line);
+            }
+        }
+    } else {
+        uint32_t end = log_count, first = end > LOG_SHOWN ? end - LOG_SHOWN : 0;
+        for (uint32_t i = first; i < end; i++)
+            text(row++, 0, "log: %.90s", log_lines[i % LOG_LINES]);
+    }
 
     uint32_t shown = trail_count < TRAIL ? trail_count : TRAIL;
     for (uint32_t i = 0; i < shown; i++) {
@@ -386,6 +434,7 @@ int main(int argc, char **argv)
     while (WHBProcIsRunning()) {
         INPUT_Update();
         take_pen();
+        log_usb();
         save_log();
 
         input_key_event ev;

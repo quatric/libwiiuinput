@@ -39,6 +39,8 @@ bool    inpw_tablet_running(void);
 void    inpw_udraw_update(void);
 bool    inpw_udraw_on(int chan);
 void    inpw_udraw_debug(int chan, uint8_t *ext, uint8_t id[6], bool *id_read);
+/* A Classic Controller read from its registers: WPAD_CLASSIC_BUTTON_* bits. */
+bool    inpw_extreg_classic(int chan, uint32_t *buttons, float st[4], float tr[2]);
 #ifdef HAVE_TABLET
 #include "input_tablet.h"
 bool    inpw_udraw_pop(tb_sample *out);
