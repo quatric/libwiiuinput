@@ -196,10 +196,17 @@ Three drivers with the same calls (open, start, read what has come, stop, close)
 
 The USB microphone and the Wii Speak are libwiiinput's drivers, moved from IOS's `/dev/usb/oh0`
 onto the Wii U's USB host stack (`nsysuhs`), isochronous streams included. The Wii Speak needs its
-boot firmware, which is Nintendo's and never in this repository: pass it to `WS_Open`, or build it in
-with `PMIC_FIRM=<file>` (or `data/pmic_firm.bin`, which `tools/extract_pmic_firmware.py` takes out
-of the RVL SDK's `pmic.a`) and use `WS_BuiltinFirmware`. The test program loads it from
-`sd:/pmic_firm.bin` and shows a level meter for each microphone. `make WITH_MIC=0` leaves them out.
+boot firmware, which the library carries: `WS_Open(WS_BuiltinFirmware(&size), size)`. The firmware
+is Nintendo's and never in this repository, so take it out of your own RVL SDK once before building:
+
+```sh
+make firmware SDK=/path/to/RVL_SDK/RVL/lib/pmic.a   # writes data/pmic_firm.bin
+make
+```
+
+`PMIC_FIRM=<file>` names another copy, and `PMIC_FIRM=none` builds without it (then
+`WS_BuiltinFirmware` returns NULL and the app passes its own to `WS_Open`). The test program uses
+the built-in firmware, or `sd:/pmic_firm.bin` without it, and shows a level meter for each microphone. `make WITH_MIC=0` leaves them out.
 
 ### Keyboard and mouse
 

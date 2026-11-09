@@ -34,18 +34,26 @@ ifeq ($(WITH_TABLET),1)
 endif
 ifeq ($(WITH_MIC),1)
  CFLAGS += -DHAVE_MIC
- # The Wii Speak's boot firmware is Nintendo's and never in this repository:
- # PMIC_FIRM=<file>, or data/pmic_firm.bin (tools/extract_pmic_firmware.py
- # takes it out of the RVL SDK's pmic.a), builds it in for WS_BuiltinFirmware.
+ # The Wii Speak's boot firmware is built into the library, so
+ # WS_BuiltinFirmware() hands it to WS_Open. It is Nintendo's and never in
+ # this repository: `make firmware SDK=<RVL_SDK>/RVL/lib/pmic.a` puts it at
+ # data/pmic_firm.bin (ignored by git), or PMIC_FIRM=<file> names one.
+ # PMIC_FIRM=none builds without it; apps then load it themselves.
  PMIC_FIRM ?= $(wildcard data/pmic_firm.bin)
- ifneq ($(strip $(PMIC_FIRM)),)
-  CFLAGS += -DWS_FIRMWARE_FILE='"$(abspath $(PMIC_FIRM))"'
+ ifneq ($(filter-out none,$(strip $(PMIC_FIRM))),)
+  ifeq ($(wildcard $(PMIC_FIRM)),)
+   $(error PMIC_FIRM=$(PMIC_FIRM) does not exist)
+  endif
+  FIRM_FILE := $(abspath $(PMIC_FIRM))
+  CFLAGS += -DWS_FIRMWARE_FILE='"$(FIRM_FILE)"'
+ else ifneq ($(strip $(PMIC_FIRM)),none)
+  $(warning No Wii Speak firmware: run `make firmware SDK=<RVL_SDK>/RVL/lib/pmic.a` to build it in)
  endif
 endif
 
 SRCS    := $(wildcard source/*.c)
 # one folder of objects for each set of options, so switching them rebuilds
-BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)$(WITH_TABLET)$(WITH_MIC)$(if $(PMIC_FIRM),f)
+BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)$(WITH_TABLET)$(WITH_MIC)$(if $(FIRM_FILE),f)
 OBJS    := $(patsubst source/%.c,$(BUILD)/%.o,$(SRCS))
 LIB     := lib/libinput-wiiu.a
 PUBLIC  := include/input_wiiu.h include/input_tablet.h include/input_wiispeak.h include/input_usbmic.h include/input_drcmic.h
@@ -62,6 +70,16 @@ $(LIB): $(OBJS) FORCE
 $(BUILD)/%.o: source/%.c $(HEADERS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# rebuilt when the firmware file changes
+$(BUILD)/libinput_wiispeak_firm.o: $(FIRM_FILE)
+
+# the Wii Speak's firmware, out of your own RVL SDK's pmic.a
+SDK ?=
+firmware:
+	@if [ -z "$(SDK)" ]; then echo "make firmware SDK=/path/to/RVL_SDK/RVL/lib/pmic.a"; exit 1; fi
+	@mkdir -p data
+	python3 tools/extract_pmic_firmware.py "$(SDK)" -o data/pmic_firm.bin
 
 install: $(LIB)
 	@mkdir -p $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/lib $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include
@@ -82,4 +100,4 @@ test:
 	cc -DHAVE_HIDPADS -Wall -Wextra -fsanitize=address,undefined -Isource tests/hid_test.c source/libinput_hid.c source/libinput_hidpads_data.c -o build-test/hid_test
 	build-test/hid_test
 
-.PHONY: all install clean test padtest FORCE
+.PHONY: all install clean test padtest firmware FORCE

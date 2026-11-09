@@ -1,8 +1,8 @@
 /* The Wii Speak's boot firmware, built into the library when one is given.
  *
  * The firmware (PMIC_FIRM_DATA, 97,480 bytes) is Nintendo's and is never in
- * this repository.  Put it at data/pmic_firm.bin (ignored by git) or pass
- * PMIC_FIRM=<file> to make; apps that compile these sources themselves define
+ * this repository.  `make firmware SDK=<pmic.a>` puts it at data/pmic_firm.bin
+ * (ignored by git), which make then builds in, or pass PMIC_FIRM=<file>; apps that compile these sources themselves define
  * WS_FIRMWARE_FILE as the file's path in quotes.  Without one,
  * WS_BuiltinFirmware() returns NULL and the app has to load it itself. */
 
