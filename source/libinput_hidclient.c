@@ -19,6 +19,7 @@
  * conversion are libwiiinput's libinput_hid.c (from RiftWii, after
  * Nintendont), unchanged. */
 
+#include <dirent.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <string.h>
@@ -99,6 +100,11 @@ static bool gcad_rumble_want[4];
 static bool pad_rumble_want[MAX_PADS];
 static hidpad_mapping user_maps[MAX_USER];
 static int user_count;
+/* Layouts from the SD card, read once at init: the system's HID thread,
+ * which offers devices, is not one to read files on. */
+#define MAX_FILES 16
+static hidpad_mapping file_maps[MAX_FILES];
+static int file_count;
 #endif
 
 static int (*gcad_log)(const char *fmt, ...);
@@ -151,73 +157,86 @@ bool INPUT_HIDPadAddConfig(const char *text, size_t length)
     return true;
 }
 
-static bool from_file(const char *path, uint32_t id, hidpad_mapping *out)
+static void load_file(const char *path)
 {
     static char text[HIDPAD_CONFIG_BYTES + 1];
     char error[96];
-    FILE *file = fopen(path, "rb");
+    hidpad_mapping m;
+    FILE *file;
     size_t size;
     bool bad;
 
-    if (!file)
-        return false;
+    if (file_count >= MAX_FILES || !(file = fopen(path, "rb")))
+        return;
     size = fread(text, 1, sizeof(text), file);
     bad = ferror(file) != 0;
     fclose(file);
-    if (bad || !hidpad_parse(text, size, out, error, sizeof(error))) {
-        PLOG("USB pad %04x:%04x: cannot use %s: %s\n", (unsigned)(id >> 16), (unsigned)(id & 0xFFFF), path,
-             bad ? "the file could not be read" : error);
-        return false;
+    if (bad || !hidpad_parse(text, size, &m, error, sizeof(error))) {
+        PLOG("USB pad: cannot use %s: %s\n", path, bad ? "the file could not be read" : error);
+        return;
     }
-    /* controller.ini is one pad's. */
-    return (((uint32_t)out->vid << 16) | out->pid) == id;
+    file_maps[file_count++] = m;
+    PLOG("USB pad: layout %04x:%04x from %s\n", m.vid, m.pid, path);
 }
 
-/* A layout the app gave first, then the files on the SD card where
- * Nintendont keeps them, then the library's own. */
-static bool find_layout(uint32_t id, hidpad_mapping *out, const char **name)
+/* Every .ini in sd:/controllers, and sd:/controller.ini, where Nintendont keeps them. */
+static void load_files(void)
 {
     static const char *const roots[] = { "fs:/vol/external01", "/vol/external01" };
+    char path[160];
+
+    file_count = 0;
+    for (unsigned r = 0; r < sizeof(roots) / sizeof(roots[0]) && !file_count; r++) {
+        DIR *dir;
+        snprintf(path, sizeof(path), "%s/controllers", roots[r]);
+        if ((dir = opendir(path))) {
+            struct dirent *e;
+            while ((e = readdir(dir)) && file_count < MAX_FILES) {
+                size_t n = strlen(e->d_name);
+                if (n > 4 && (!strcmp(e->d_name + n - 4, ".ini") || !strcmp(e->d_name + n - 4, ".INI"))) {
+                    snprintf(path, sizeof(path), "%s/controllers/%s", roots[r], e->d_name);
+                    load_file(path);
+                }
+            }
+            closedir(dir);
+        }
+        snprintf(path, sizeof(path), "%s/controller.ini", roots[r]);
+        load_file(path);
+    }
+}
+
+/* A layout the app gave first, then the SD card's, then the library's own.
+ * Reads nothing: called on the HID thread. */
+static bool find_layout(uint32_t id, hidpad_mapping *out, const char **name)
+{
     const hidpad_builtin *builtin;
-    char path[96];
-    unsigned vid = id >> 16, pid = id & 0xFFFF;
     bool found = false;
 
     lock_take();
     for (int i = 0; i < user_count && !found; i++) {
         if ((((uint32_t)user_maps[i].vid << 16) | user_maps[i].pid) == id) {
             *out = user_maps[i];
+            *name = "the app's layout";
             found = true;
         }
     }
     lock_give();
-    if (found) {
-        *name = "the app's layout";
+    for (int i = 0; i < file_count && !found; i++) {
+        if ((((uint32_t)file_maps[i].vid << 16) | file_maps[i].pid) == id) {
+            *out = file_maps[i];
+            *name = "a file on the SD card";
+            found = true;
+        }
+    }
+    if (found)
         return true;
-    }
-    for (unsigned r = 0; r < sizeof(roots) / sizeof(roots[0]); r++) {
-        snprintf(path, sizeof(path), "%s/controllers/%04X_%04X.ini", roots[r], vid, pid);
-        if (from_file(path, id, out)) {
-            *name = "a file on the SD card";
-            return true;
-        }
-        snprintf(path, sizeof(path), "%s/controllers/%04x_%04x.ini", roots[r], vid, pid);
-        if (from_file(path, id, out)) {
-            *name = "a file on the SD card";
-            return true;
-        }
-        snprintf(path, sizeof(path), "%s/controller.ini", roots[r]);
-        if (from_file(path, id, out)) {
-            *name = "controller.ini";
-            return true;
-        }
-    }
     builtin = hidpad_find_builtin(id);
     if (builtin) {
         char error[96];
 
         if (!hidpad_parse(builtin->text, strlen(builtin->text), out, error, sizeof(error))) {
-            PLOG("USB pad %04x:%04x: the built-in layout (%s) cannot be used: %s\n", vid, pid, builtin->file, error);
+            PLOG("USB pad %04x:%04x: the built-in layout (%s) cannot be used: %s\n", (unsigned)(id >> 16),
+                 (unsigned)(id & 0xFFFF), builtin->file, error);
             return false;
         }
         *name = builtin->name;
@@ -465,8 +484,12 @@ static int32_t attach_pad(HIDDevice *d, int idx)
     slot_t *s;
     void *ctx;
 
-    if (!find_layout(id, &map, &where))
+    if (!find_layout(id, &map, &where)) {
+        if (!(d->subClass == 1 && d->protocol == 2)) /* a mouse is said below */
+            PLOG("USB %04x:%04x if %u (%u/%u, %u bytes): no layout, left alone\n", d->vid, d->pid, d->interfaceIndex,
+             d->subClass, d->protocol, d->maxPacketSizeRx);
         return UNCLAIMED;
+    }
     if (map.polltype && d->maxPacketSizeRx < map.report_bytes) {
         PLOG("USB pad %04x:%04x: interface %u sends %u byte reports, the layout needs %u: left alone\n", d->vid,
              d->pid, d->interfaceIndex, d->maxPacketSizeRx, map.report_bytes);
@@ -481,6 +504,8 @@ static int32_t attach_pad(HIDDevice *d, int idx)
         /* One interface per pad: the first one offered that reports. */
         if (slots[i].phys == d->physicalDeviceInst && slots[i].vid == d->vid && slots[i].pid == d->pid) {
             lock_give();
+            PLOG("USB %04x:%04x if %u: another interface of a pad already read\n", d->vid, d->pid,
+                 d->interfaceIndex);
             return UNCLAIMED;
         }
     }
@@ -489,6 +514,7 @@ static int32_t attach_pad(HIDDevice *d, int idx)
             port = i;
     if (port < 0) {
         lock_give();
+        PLOG("USB %04x:%04x: four pads already\n", d->vid, d->pid);
         return UNCLAIMED;
     }
     s = take_slot(idx, K_PAD, d);
@@ -557,9 +583,16 @@ static int32_t on_attach(HIDClient *c, HIDDevice *d, HIDAttachEvent event)
         return kind != K_NONE ? CLAIMED : UNCLAIMED;
     }
 
-    /* Keyboards belong to the keyboard library. */
-    if (d->subClass == 1 && d->protocol == 1)
+    /* Keyboards belong to the keyboard library, tablets to the tablet driver. */
+    if (d->subClass == 1 && d->protocol == 1) {
+        PLOG("USB %04x:%04x if %u: keyboard\n", d->vid, d->pid, d->interfaceIndex);
         return UNCLAIMED;
+    }
+    if (inpw_tablet_vendor(d->vid)) {
+        PLOG("USB %04x:%04x if %u: a tablet maker's, left to the tablet driver\n", d->vid, d->pid,
+             d->interfaceIndex);
+        return UNCLAIMED;
+    }
 
     lock_take();
     idx = free_slot();
@@ -582,8 +615,10 @@ static int32_t on_attach(HIDClient *c, HIDDevice *d, HIDAttachEvent event)
             return r;
     }
 #endif
-    if (want_mouse && d->subClass == 1 && d->protocol == 2)
+    if (want_mouse && d->subClass == 1 && d->protocol == 2) {
+        PLOG("USB %04x:%04x if %u: mouse\n", d->vid, d->pid, d->interfaceIndex);
         return attach_mouse(d, idx);
+    }
     return UNCLAIMED;
 }
 
@@ -626,6 +661,10 @@ int32_t inpw_hid_init(bool mouse, bool gcadapter, bool hidpads)
     }
     memset(gcad_rumble_want, 0, sizeof(gcad_rumble_want));
     memset(&client, 0, sizeof(client));
+#ifdef HAVE_HIDPADS
+    if (want_pads)
+        load_files();
+#endif
 
     /* The keyboard library may have set the HID library up already; only
      * what this side set up is torn down. */

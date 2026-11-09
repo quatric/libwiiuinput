@@ -5,6 +5,11 @@
  *     triggers, battery and its own raw bits
  *   - the folded buttons, sticks, IR pointer, touch, cursor, mouse and
  *     keyboard, the way an app sees them
+ *   - USB pen tablets and the uDraw: the pen's state, and a trail drawn
+ *     where it touches (bigger with more pressure)
+ *   - per Wii Remote channel, what KPAD and WPAD report, for finding out
+ *     why an extension is not read
+ *   - every driver's log, on screen and in sd:/padtest.log
  *   - A+B held on a controller rumbles that controller
  *   - HOME (or Esc) held for two seconds exits
  */
@@ -23,6 +28,7 @@
 #include <sysapp/launch.h>
 #include <whb/proc.h>
 
+#include <input_tablet.h>
 #include <input_wiiu.h>
 
 #define HEAP_TAG 0x50414454 /* 'PADT' */
@@ -39,6 +45,8 @@
 #define C_HELD   0x2E8B3AFF
 #define C_CURSOR 0xFFD040FF
 #define C_IR     0x40C0FFFF
+#define C_PEN    0xF06090FF
+#define C_HOVER  0xFFFFFFFF
 
 static void *screen_mem;
 static uint32_t tv_size, drc_size;
@@ -154,13 +162,17 @@ static void held_names(uint32_t held, char *out, size_t size)
             at += snprintf(out + at, size - at, "%s ", BUTTONS[i].name);
 }
 
-/* What the GameCube adapter and USB pad drivers say, the last few lines. */
-static char log_lines[3][96];
-static volatile int log_next;
+/* What the drivers say: kept in a ring (they call from the system's HID
+ * thread), shown on screen and written to sd:/padtest.log by the main loop. */
+#define LOG_LINES 64
+#define LOG_SHOWN 6
+static char log_lines[LOG_LINES][112];
+static volatile uint32_t log_count;
+static uint32_t log_saved;
 
 static int log_print(const char *fmt, ...)
 {
-    char line[96];
+    char line[112];
     va_list ap;
     int n;
 
@@ -168,10 +180,61 @@ static int log_print(const char *fmt, ...)
     n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     line[strcspn(line, "\n")] = 0;
-    int i = log_next % 3;
-    memcpy(log_lines[i], line, sizeof(line));
-    log_next = i + 1;
+    uint32_t i = log_count;
+    memcpy(log_lines[i % LOG_LINES], line, sizeof(line));
+    log_count = i + 1;
     return n;
+}
+
+static void save_log(void)
+{
+    uint32_t end = log_count;
+    FILE *f;
+
+    if (log_saved == end)
+        return;
+    if (end - log_saved > LOG_LINES)
+        log_saved = end - LOG_LINES;
+    f = fopen("fs:/vol/external01/padtest.log", log_saved ? "a" : "w");
+    if (!f) {
+        log_saved = end;
+        return;
+    }
+    for (; log_saved != end; log_saved++)
+        fprintf(f, "%s\n", log_lines[log_saved % LOG_LINES]);
+    fclose(f);
+}
+
+/* Where the pen touched, newest last, in TV coordinates. */
+#define TRAIL 1024
+static struct { int16_t x, y; uint8_t size; } trail[TRAIL];
+static uint32_t trail_count;
+static bool pen_hover;
+static int pen_x, pen_y;
+
+static void take_pen(void)
+{
+    tb_sample s;
+
+    while (TB_Pop(&s)) {
+        int x, y;
+        TB_ToScreen(&s, TV_W, TV_H, &x, &y);
+        pen_hover = s.in_range;
+        pen_x = x;
+        pen_y = y;
+        if (s.buttons & TB_BUTTON_TIP) {
+            uint32_t i = trail_count++ % TRAIL;
+            trail[i].x = (int16_t)x;
+            trail[i].y = (int16_t)y;
+            trail[i].size = (uint8_t)(1 + s.pressure * 3);
+        }
+    }
+}
+
+static void dot(int x, int y, int size, uint32_t color)
+{
+    rect(SCREEN_TV, x - size, y - size, size * 2 + 1, size * 2 + 1, color);
+    rect(SCREEN_DRC, x * DRC_W / TV_W - size / 2, y * DRC_H / TV_H - size / 2, size + 1, size + 1, color);
 }
 
 static char typed[40];
@@ -188,15 +251,15 @@ static void draw(void)
     OSScreenClearBufferEx(SCREEN_DRC, C_BG);
 
     text(0, 0, "libwiiuinput controller test");
-    text(1, 0, "A+B on a controller: rumble it. Hold HOME or Esc 2 s: exit.");
+    text(1, 0, "A+B on a controller: rumble it. Hold HOME or Esc 2 s: exit. Log: sd:/padtest.log");
 
-    text(3, 0, "Buttons");
-    buttons_row(3, 9, held);
+    text(2, 0, "Buttons");
+    buttons_row(2, 9, held);
 
     INPUT_Stick(INPUT_STICK_LEFT, &lx, &ly, &lsrc);
     INPUT_Stick(INPUT_STICK_RIGHT, &rx, &ry, &rsrc);
-    text(4, 0, "Source   %-10s  Gforce %.2f", INPUT_Source(), INPUT_Gforce());
-    text(5, 0, "Sticks   L %+.2f %+.2f %-9s  R %+.2f %+.2f %s", lx, ly, lsrc, rx, ry, rsrc);
+    text(3, 0, "Source   %-10s  Gforce %.2f", INPUT_Source(), INPUT_Gforce());
+    text(4, 0, "Sticks   L %+.2f %+.2f %-9s  R %+.2f %+.2f %s", lx, ly, lsrc, rx, ry, rsrc);
 
     bool ir = INPUT_Pointer(&px, &py), touch = INPUT_Touch(&tx, &ty), cur = INPUT_CursorActive();
     INPUT_CursorPosition(&cx, &cy);
@@ -204,23 +267,55 @@ static void draw(void)
     if (ir) snprintf(irs, sizeof(irs), "%d,%d", (int)px, (int)py);
     if (touch) snprintf(ts, sizeof(ts), "%d,%d", tx, ty);
     if (cur) snprintf(cs, sizeof(cs), "%d,%d", cx, cy);
-    text(6, 0, "Pointer  IR %-10s Touch %-10s Cursor %s", irs, ts, cs);
+    text(5, 0, "Pointer  IR %-10s Touch %-10s Cursor %s", irs, ts, cs);
 
     INPUT_MousePosition(&mx, &my);
     INPUT_MouseDelta(&dx, &dy, &wheel);
-    text(7, 0, "Mouse    %-3s %4d,%-4d  buttons %c%c%c  wheel %+d", INPUT_MouseConnected() ? "yes" : "no", mx, my,
+    text(6, 0, "Mouse    %-3s %4d,%-4d  buttons %c%c%c  wheel %+d", INPUT_MouseConnected() ? "yes" : "no", mx, my,
          (mb & INPUT_MOUSE_LEFT) ? 'L' : '-', (mb & INPUT_MOUSE_MIDDLE) ? 'M' : '-',
          (mb & INPUT_MOUSE_RIGHT) ? 'R' : '-', wheel);
-    text(8, 0, "Keyboard %-3s %c%c%c%c  typed: %s_", INPUT_KeyboardConnected() ? "yes" : "no",
+    text(7, 0, "Keyboard %-3s %c%c%c%c  typed: %s_", INPUT_KeyboardConnected() ? "yes" : "no",
          (mods & INPUT_MOD_SHIFT) ? 'S' : '-', (mods & INPUT_MOD_CTRL) ? 'C' : '-', (mods & INPUT_MOD_ALT) ? 'A' : '-',
          (mods & INPUT_MOD_GUI) ? 'G' : '-', typed);
-    text(9, 0, "Adapter  %-3s  USB pads %s", INPUT_GCAdapterConnected() ? "yes" : "no",
+    text(8, 0, "Adapter  %-3s  USB pads %s", INPUT_GCAdapterConnected() ? "yes" : "no",
          INPUT_HIDPadConnected() ? "yes" : "no");
 
+    /* Pen tablets and the uDraw. */
+    tb_info ti;
+    tb_sample ts_;
+    if (TB_GetInfo(&ti)) {
+        TB_GetState(&ts_);
+        text(9, 0, "Tablet   %-.24s %s%d,%d p%.2f %s%s%s%s pad %04x", ti.name,
+             ts_.wiimote >= 0 ? "(Wii Remote) " : "", (int)ts_.x, (int)ts_.y, ts_.pressure,
+             ts_.in_range ? "near " : "away ", (ts_.buttons & TB_BUTTON_TIP) ? "TIP " : "",
+             (ts_.buttons & TB_BUTTON_BARREL) ? "B1 " : "", (ts_.buttons & TB_BUTTON_BARREL2) ? "B2 " : "", ts_.pad);
+    } else {
+        text(9, 0, "Tablet   none (USB pen tablet, or a uDraw on a Wii Remote)");
+    }
+
+    /* What the system reports per Wii Remote channel. */
+    for (int ch = 0; ch < 4; ch++) {
+        input_remote_debug r;
+        if (!INPUT_RemoteDebug(ch, &r))
+            continue;
+        if (r.kpad_error == -2 && r.wpad_error != 0) {
+            text(10 + ch, 0, "Remote %d -", ch + 1);
+            continue;
+        }
+        char id[24] = "";
+        if (r.ext_id_read)
+            snprintf(id, sizeof(id), " id %02x%02x%02x%02x%02x%02x", r.ext_id[0], r.ext_id[1], r.ext_id[2],
+                     r.ext_id[3], r.ext_id[4], r.ext_id[5]);
+        text(10 + ch, 0, "Remote %d KPAD err %d n %d ext %02x | WPAD err %d ext %02x fmt %02x | cl %04x/%04x%s%s%s",
+             ch + 1, r.kpad_error, r.kpad_samples, r.kpad_ext & 0xFF, r.wpad_error, r.wpad_ext & 0xFF, r.format & 0xFF,
+             (unsigned)r.classic_kpad, (unsigned)r.classic_wpad, r.wpad_classic_used ? " (WPAD)" : "",
+             r.udraw ? " uDraw" : "", id);
+    }
+
     int n = INPUT_DeviceCount();
-    text(11, 0, "Controllers: %d", n);
-    row = 12;
-    for (int i = 0; i < n && row < 26; i++, row++) {
+    text(14, 0, "Controllers: %d", n);
+    row = 15;
+    for (int i = 0; i < n && row < 21; i++, row++) {
         input_device d;
         char names[64], bat[16] = " - ";
         INPUT_DeviceGet(i, &d);
@@ -235,11 +330,18 @@ static void draw(void)
         if (d.pointer)
             mark((int)d.px, (int)d.py, 10, d.kind == INPUT_DEV_GAMEPAD ? C_HELD : C_IR);
     }
-    for (int i = 0; i < 3 && row < 26; i++) {
-        const char *l = log_lines[(log_next + i) % 3];
-        if (l[0])
-            text(row++, 0, "log: %s", l);
+    row = 21;
+    uint32_t end = log_count, first = end > LOG_SHOWN ? end - LOG_SHOWN : 0;
+    for (uint32_t i = first; i < end; i++)
+        text(row++, 0, "log: %.90s", log_lines[i % LOG_LINES]);
+
+    uint32_t shown = trail_count < TRAIL ? trail_count : TRAIL;
+    for (uint32_t i = 0; i < shown; i++) {
+        uint32_t k = (trail_count - shown + i) % TRAIL;
+        dot(trail[k].x, trail[k].y, trail[k].size, C_PEN);
     }
+    if (pen_hover)
+        mark(pen_x, pen_y, 8, C_HOVER);
 
     if (cur)
         mark(cx, cy, 16, C_CURSOR);
@@ -276,11 +378,15 @@ int main(int argc, char **argv)
 
     INPUT_GCAdapterSetLog(log_print);
     INPUT_HIDPadSetLog(log_print);
+    TB_SetLog(log_print);
     INPUT_Init();
+    TB_Init();
     INPUT_SetScreenSize(TV_W, TV_H);
 
     while (WHBProcIsRunning()) {
         INPUT_Update();
+        take_pen();
+        save_log();
 
         input_key_event ev;
         while (INPUT_KeyPop(&ev)) {
@@ -319,7 +425,9 @@ int main(int argc, char **argv)
         OSSleepTicks(OSMillisecondsToTicks(16));
     }
 
+    TB_Shutdown();
     INPUT_Shutdown();
+    save_log();
 
     /* Outside the Homebrew Launcher a title may only leave through the Wii U
      * Menu, with ProcUI running (as GodModeU does). */

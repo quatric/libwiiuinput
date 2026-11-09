@@ -18,19 +18,24 @@ CFLAGS  := -O2 -Wall -Wextra -ffunction-sections -fdata-sections $(MACHDEP) \
 # controller.ini layouts). Both on by default; neither needs another library.
 WITH_GCADAPTER ?= 1
 WITH_HIDPADS   ?= 1
+# USB pen tablets and the uDraw GameTablet (input_tablet.h)
+WITH_TABLET    ?= 1
 ifeq ($(WITH_GCADAPTER),1)
  CFLAGS += -DHAVE_GCADAPTER
 endif
 ifeq ($(WITH_HIDPADS),1)
  CFLAGS += -DHAVE_HIDPADS
 endif
+ifeq ($(WITH_TABLET),1)
+ CFLAGS += -DHAVE_TABLET
+endif
 
 SRCS    := $(wildcard source/*.c)
 # one folder of objects for each set of options, so switching them rebuilds
-BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)
+BUILD   := build/$(WITH_GCADAPTER)$(WITH_HIDPADS)$(WITH_TABLET)
 OBJS    := $(patsubst source/%.c,$(BUILD)/%.o,$(SRCS))
 LIB     := lib/libinput-wiiu.a
-HEADERS := source/libinput_internal.h source/libinput_hid.h include/input_wiiu.h
+HEADERS := source/libinput_internal.h source/libinput_hid.h source/libinput_hidparse.h include/input_wiiu.h include/input_tablet.h
 
 all: $(LIB)
 
@@ -47,7 +52,7 @@ $(BUILD)/%.o: source/%.c $(HEADERS)
 install: $(LIB)
 	@mkdir -p $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/lib $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include
 	cp $(LIB) $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/lib/
-	cp include/input_wiiu.h $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include/
+	cp include/input_wiiu.h include/input_tablet.h $(DESTDIR)$(DEVKITPRO)/portlibs/wiiu/include/
 
 # the controller test program (example/padtest), a .wuhb for the Homebrew Launcher
 padtest: $(LIB)

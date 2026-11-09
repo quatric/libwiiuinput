@@ -33,4 +33,18 @@ void    inpw_mouse_update(void);
 void    inpw_mouse_set_bounds(int w, int h);
 void    inpw_cursor_update(void);
 
+/* Pen tablets (libinput_tablet.c) and the uDraw (libinput_udraw.c). */
+bool    inpw_tablet_vendor(uint16_t vid);
+bool    inpw_tablet_running(void);
+void    inpw_udraw_update(void);
+bool    inpw_udraw_on(int chan);
+void    inpw_udraw_debug(int chan, uint8_t *ext, uint8_t id[6], bool *id_read);
+#ifdef HAVE_TABLET
+#include "input_tablet.h"
+bool    inpw_udraw_pop(tb_sample *out);
+bool    inpw_udraw_state(tb_sample *out);
+bool    inpw_udraw_info(tb_info *info);
+void    inpw_udraw_extent(int32_t *w, int32_t *h);
+#endif
+
 #endif

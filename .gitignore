@@ -5,3 +5,4 @@ lib/
 *.rpx
 *.wuhb
 *.rpx.map
+.DS_Store

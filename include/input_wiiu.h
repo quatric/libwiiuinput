@@ -163,6 +163,26 @@ bool INPUT_DeviceGet(int index, input_device *out);
  * keeps rumbling until turned off; INPUT_Shutdown stops everything. */
 void INPUT_DeviceRumble(int index, bool on);
 
+/* What the system says about a Wii Remote channel (0-3) this frame, for
+ * finding out why a controller or extension is not read. */
+typedef struct {
+    int      kpad_error;      /* KPADReadEx's error (0 ok, -1 no new sample, -2 no controller) */
+    int      kpad_samples;    /* samples it returned */
+    int      kpad_ext;        /* the extension KPAD reports (WPAD_EXT_*), 0xFF when none */
+    int      wpad_error;      /* WPADProbe's error */
+    int      wpad_ext;        /* the extension WPADProbe reports */
+    int      format;          /* WPADGetDataFormat */
+    uint32_t classic_kpad;    /* Classic buttons through KPAD */
+    uint32_t classic_wpad;    /* Classic buttons through WPADRead */
+    bool     wpad_classic_used; /* KPAD gave nothing, WPAD's reading was used */
+    bool     udraw;           /* a uDraw is being read on this channel */
+    uint8_t  udraw_ext;       /* the extension type the uDraw check last saw */
+    uint8_t  ext_id[6];       /* the extension's ID bytes, when read (unknown extensions only) */
+    bool     ext_id_read;
+} input_remote_debug;
+
+bool INPUT_RemoteDebug(int chan, input_remote_debug *out);
+
 /* ---- Keyboard (USB HID usage codes, e.g. 0x28 = Enter), through nsyskbd ---- */
 bool INPUT_KeyboardConnected(void);
 bool INPUT_KeyHeld(uint8_t keycode);      /* live state */

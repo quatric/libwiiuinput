@@ -19,7 +19,6 @@
 
 #define STICK_ACTIVE 0.18f
 #define MAX_DEVICES 16
-#define KPAD_SAMPLES 8
 #define CORE_BUTTONS (WPAD_BUTTON_LEFT | WPAD_BUTTON_RIGHT | WPAD_BUTTON_DOWN | WPAD_BUTTON_UP | \
                       WPAD_BUTTON_PLUS | WPAD_BUTTON_2 | WPAD_BUTTON_1 | WPAD_BUTTON_B | WPAD_BUTTON_A | \
                       WPAD_BUTTON_MINUS | WPAD_BUTTON_HOME)
@@ -101,6 +100,7 @@ typedef struct {
 typedef struct {
     bool connected;
     KPADStatus st;
+    uint32_t prev_core, prev_ext; /* held bits of the frame before */
     bool ir_valid;
     float ir_x, ir_y;
     euro_t fx, fy;
@@ -367,40 +367,73 @@ static void read_gamepad(void)
     }
 }
 
+/* What the last frame saw on each channel, for INPUT_RemoteDebug. */
+static input_remote_debug rdebug[4];
+
+/* The Classic Controller as WPAD itself reads it: used when KPAD does not
+ * report the Classic it has (WPADProbe says one is plugged in). WPAD's
+ * stick values are scaled by the largest seen, as their range is not
+ * documented. */
+static float cl_range[4][4];
+
+static bool wpad_classic(int ch, uint32_t *buttons, float st[4], float tr[2])
+{
+    WPADStatusClassic cs;
+    WPADDataFormat fmt = WPADGetDataFormat((WPADChan)ch);
+
+    if (fmt != WPAD_FMT_CLASSIC && fmt != WPAD_FMT_CLASSIC_ACC && fmt != WPAD_FMT_CLASSIC_ACC_DPD) {
+        /* The system has not switched the report to one with the Classic's bytes. */
+        WPADSetDataFormat((WPADChan)ch, use_pointer ? WPAD_FMT_CLASSIC_ACC_DPD : WPAD_FMT_CLASSIC_ACC);
+        return false;
+    }
+    memset(&cs, 0, sizeof(cs));
+    WPADRead((WPADChan)ch, (WPADStatus *)&cs);
+    if (cs.core.error != WPAD_ERROR_NONE)
+        return false;
+    *buttons = cs.buttons;
+    int16_t v[4] = { cs.leftStick.x, cs.leftStick.y, cs.rightStick.x, cs.rightStick.y };
+    for (int i = 0; i < 4; i++) {
+        float a = (float)(v[i] < 0 ? -v[i] : v[i]);
+        if (cl_range[ch][i] < 32.0f)
+            cl_range[ch][i] = 32.0f;
+        if (a > cl_range[ch][i])
+            cl_range[ch][i] = a;
+        st[i] = v[i] / cl_range[ch][i];
+    }
+    tr[0] = cs.leftTrigger / 255.0f;
+    tr[1] = cs.rightTrigger / 255.0f;
+    return true;
+}
+
 static void read_remote(int ch, float dt)
 {
-    KPADStatus buf[KPAD_SAMPLES];
+    KPADStatus st;
     KPADError err = KPAD_ERROR_OK;
     kpad_cache_t *c = &kcache[ch];
-    uint32_t trig = 0, ext_trig = 0;
+    input_remote_debug *dbg = &rdebug[ch];
     int n;
 
-    n = (int)KPADReadEx((KPADChan)ch, buf, KPAD_SAMPLES, &err);
+    memset(&st, 0, sizeof(st));
+    /* One sample, the newest, as GodModeU, snes9xgx and RetroArch read it;
+     * presses between frames are caught from the held bits below. */
+    n = (int)KPADReadEx((KPADChan)ch, &st, 1, &err);
+    dbg->kpad_error = err;
+    dbg->kpad_samples = n;
     if (n > 0 && err == KPAD_ERROR_OK) {
-        /* Newest first; a press seen in any sample since the last frame counts. */
-        for (int i = 0; i < n; i++) {
-            trig |= buf[i].trigger;
-            if (buf[i].extensionType == WPAD_EXT_PRO_CONTROLLER)
-                ext_trig |= buf[i].pro.trigger;
-            else if (buf[i].extensionType == WPAD_EXT_CLASSIC || buf[i].extensionType == WPAD_EXT_MPLUS_CLASSIC)
-                ext_trig |= buf[i].classic.trigger;
-            else if (buf[i].extensionType == WPAD_EXT_NUNCHUK || buf[i].extensionType == WPAD_EXT_MPLUS_NUNCHUK)
-                ext_trig |= buf[i].nunchuk.trigger;
-        }
         if (!c->connected) {
             c->fx.first = c->fy.first = true;
             c->ir_valid = false;
         }
         c->connected = true;
-        c->st = buf[0];
+        c->st = st;
         c->battery = WPADGetBatteryLevel((WPADChan)ch) * 25;
         if (c->battery > 100)
             c->battery = 100;
 
-        if (use_pointer && buf[0].extensionType != WPAD_EXT_PRO_CONTROLLER && buf[0].posValid > 0) {
+        if (use_pointer && st.extensionType != WPAD_EXT_PRO_CONTROLLER && st.posValid > 0) {
             /* pos is -1..1 across the screen, y down. */
-            float rx = clampf((buf[0].pos.x * 0.5f + 0.5f) * inpw_screen_w, 0, inpw_screen_w - 1);
-            float ry = clampf((buf[0].pos.y * 0.5f + 0.5f) * inpw_screen_h, 0, inpw_screen_h - 1);
+            float rx = clampf((st.pos.x * 0.5f + 0.5f) * inpw_screen_w, 0, inpw_screen_w - 1);
+            float ry = clampf((st.pos.y * 0.5f + 0.5f) * inpw_screen_h, 0, inpw_screen_h - 1);
             if (!c->ir_valid)
                 c->fx.first = c->fy.first = true; /* snap to a newly found sensor bar */
             c->ir_x = euro_filter(&c->fx, rx, dt);
@@ -414,66 +447,108 @@ static void read_remote(int ch, float dt)
     } else {
         memset(c, 0, sizeof(*c));
     }
-    if (!c->connected)
+
+    WPADExtensionType probe = WPAD_EXT_CORE;
+    dbg->wpad_error = WPADProbe((WPADChan)ch, &probe);
+    dbg->wpad_ext = dbg->wpad_error == WPAD_ERROR_NONE ? probe : 0xFF;
+    dbg->format = WPADGetDataFormat((WPADChan)ch);
+    dbg->kpad_ext = c->connected ? c->st.extensionType : 0xFF;
+    dbg->udraw = inpw_udraw_on(ch);
+    dbg->classic_kpad = 0;
+    dbg->classic_wpad = 0;
+    dbg->wpad_classic_used = false;
+
+    if (!c->connected) {
+        c->prev_core = c->prev_ext = 0;
         return;
+    }
 
     const KPADStatus *s = &c->st;
     input_device *d;
 
     if (s->extensionType == WPAD_EXT_PRO_CONTROLLER) {
-        uint32_t held = map_pro(s->pro.hold), down = map_pro(ext_trig);
+        uint32_t raw = s->pro.hold;
+        uint32_t held = map_pro(raw), down = map_pro(s->pro.trigger | (raw & ~c->prev_ext));
+        c->prev_ext = raw;
         feed("Wii U Pro", held, down);
         stick_feed(INPUT_STICK_LEFT, "Wii U Pro", s->pro.leftStick.x, s->pro.leftStick.y);
         stick_feed(INPUT_STICK_RIGHT, "Wii U Pro", s->pro.rightStick.x, s->pro.rightStick.y);
         d = dev_add(INPUT_DEV_PRO, ch, "Wii U Pro", held, down);
         if (d) {
-            d->raw = s->pro.hold;
+            d->raw = raw;
             d->lx = s->pro.leftStick.x;
             d->ly = s->pro.leftStick.y;
             d->rx = s->pro.rightStick.x;
             d->ry = s->pro.rightStick.y;
-            d->lt = (s->pro.hold & WPAD_PRO_BUTTON_ZL) ? 1.0f : 0.0f;
-            d->rt = (s->pro.hold & WPAD_PRO_BUTTON_ZR) ? 1.0f : 0.0f;
+            d->lt = (raw & WPAD_PRO_BUTTON_ZL) ? 1.0f : 0.0f;
+            d->rt = (raw & WPAD_PRO_BUTTON_ZR) ? 1.0f : 0.0f;
             d->battery = c->battery;
         }
         return;
     }
 
-    uint32_t core_h = s->hold & CORE_BUTTONS & ~wiimote_ignored[ch];
-    uint32_t core_d = trig & CORE_BUTTONS & ~wiimote_ignored[ch];
+    uint32_t core_raw = s->hold & 0xFFFF;
+    uint32_t core_h = core_raw & CORE_BUTTONS & ~wiimote_ignored[ch];
+    uint32_t core_d = (s->trigger | (core_raw & ~c->prev_core)) & CORE_BUTTONS & ~wiimote_ignored[ch];
     uint32_t xh = 0, xd = 0, ext_raw = 0;
-    const char *name = "Wiimote";
+    const char *name = inpw_udraw_on(ch) ? "uDraw" : "Wiimote";
+    float cl_st[4] = { 0, 0, 0, 0 }, cl_tr[2] = { 0, 0 };
+    bool classic = false, nunchuk = false;
 
-    feed("Wiimote", core_h, core_d);
-    d = dev_add(INPUT_DEV_WIIMOTE, ch, "Wiimote", 0, 0);
+    c->prev_core = core_raw;
 
     if (s->extensionType == WPAD_EXT_CLASSIC || s->extensionType == WPAD_EXT_MPLUS_CLASSIC) {
-        name = "Classic";
+        classic = true;
         ext_raw = s->classic.hold;
-        xh = map_classic(s->classic.hold);
-        xd = map_classic(ext_trig);
-        stick_feed(INPUT_STICK_LEFT, "Classic", s->classic.leftStick.x, s->classic.leftStick.y);
-        stick_feed(INPUT_STICK_RIGHT, "Classic", s->classic.rightStick.x, s->classic.rightStick.y);
-        if (d) {
-            d->lx = s->classic.leftStick.x;
-            d->ly = s->classic.leftStick.y;
-            d->rx = s->classic.rightStick.x;
-            d->ry = s->classic.rightStick.y;
-            d->lt = clampf(s->classic.leftTrigger, 0, 1);
-            d->rt = clampf(s->classic.rightTrigger, 0, 1);
-        }
-    } else if (s->extensionType == WPAD_EXT_NUNCHUK || s->extensionType == WPAD_EXT_MPLUS_NUNCHUK) {
-        name = "Nunchuk";
-        ext_raw = s->nunchuk.hold;
-        xh = map_nunchuk(s->nunchuk.hold);
-        xd = map_nunchuk(ext_trig);
-        stick_feed(INPUT_STICK_LEFT, "Nunchuk", s->nunchuk.stick.x, s->nunchuk.stick.y);
-        if (d) {
-            d->lx = s->nunchuk.stick.x;
-            d->ly = s->nunchuk.stick.y;
+        dbg->classic_kpad = ext_raw;
+        cl_st[0] = s->classic.leftStick.x;
+        cl_st[1] = s->classic.leftStick.y;
+        cl_st[2] = s->classic.rightStick.x;
+        cl_st[3] = s->classic.rightStick.y;
+        cl_tr[0] = clampf(s->classic.leftTrigger, 0, 1);
+        cl_tr[1] = clampf(s->classic.rightTrigger, 0, 1);
+    }
+    if ((probe == WPAD_EXT_CLASSIC || probe == WPAD_EXT_MPLUS_CLASSIC) && !dbg->udraw) {
+        uint32_t wb = 0;
+        float wst[4], wtr[2];
+        if (wpad_classic(ch, &wb, wst, wtr)) {
+            dbg->classic_wpad = wb;
+            /* KPAD gave nothing for the Classic WPAD sees: take WPAD's. */
+            if (!classic || (!ext_raw && wb)) {
+                classic = true;
+                dbg->wpad_classic_used = true;
+                ext_raw |= wb;
+                for (int i = 0; i < 4; i++)
+                    if (fabsf(wst[i]) > fabsf(cl_st[i]))
+                        cl_st[i] = wst[i];
+                cl_tr[0] = wtr[0] > cl_tr[0] ? wtr[0] : cl_tr[0];
+                cl_tr[1] = wtr[1] > cl_tr[1] ? wtr[1] : cl_tr[1];
+            }
         }
     }
+    if (!classic && (s->extensionType == WPAD_EXT_NUNCHUK || s->extensionType == WPAD_EXT_MPLUS_NUNCHUK)) {
+        nunchuk = true;
+        /* Z and C come in the core bits; the Nunchuk's own field too, where filled. */
+        ext_raw = (s->hold | s->nunchuk.hold) & (WPAD_NUNCHUK_BUTTON_Z | WPAD_NUNCHUK_BUTTON_C);
+    }
+
+    if (classic) {
+        name = "Classic";
+        xh = map_classic(ext_raw);
+        xd = map_classic(ext_raw & ~c->prev_ext);
+        stick_feed(INPUT_STICK_LEFT, "Classic", cl_st[0], cl_st[1]);
+        stick_feed(INPUT_STICK_RIGHT, "Classic", cl_st[2], cl_st[3]);
+    } else if (nunchuk) {
+        name = "Nunchuk";
+        xh = map_nunchuk(ext_raw);
+        xd = map_nunchuk(ext_raw & ~c->prev_ext);
+        stick_feed(INPUT_STICK_LEFT, "Nunchuk", s->nunchuk.stick.x, s->nunchuk.stick.y);
+    }
+    c->prev_ext = ext_raw;
+
+    feed("Wiimote", core_h, core_d);
     feed(name, xh, xd);
+    d = dev_add(INPUT_DEV_WIIMOTE, ch, name, core_h | xh, core_d | xd);
 
     if (c->ir_valid && !pointer_valid) {
         pointer_valid = true;
@@ -486,16 +561,35 @@ static void read_remote(int ch, float dt)
         gforce_max = g;
 
     if (d) {
-        d->name = name;
-        d->held = core_h | xh;
-        d->down = core_d | xd;
-        d->raw = s->hold & 0xFFFF;
+        d->raw = core_raw;
         d->raw_ext = ext_raw;
         d->battery = c->battery;
         d->pointer = c->ir_valid;
         d->px = c->ir_x;
         d->py = c->ir_y;
+        if (classic) {
+            d->lx = cl_st[0];
+            d->ly = cl_st[1];
+            d->rx = cl_st[2];
+            d->ry = cl_st[3];
+            d->lt = cl_tr[0];
+            d->rt = cl_tr[1];
+        } else if (nunchuk) {
+            d->lx = s->nunchuk.stick.x;
+            d->ly = s->nunchuk.stick.y;
+        }
     }
+}
+
+bool INPUT_RemoteDebug(int chan, input_remote_debug *out)
+{
+    if (chan < 0 || chan > 3 || !use_kpad)
+        return false;
+    if (out) {
+        *out = rdebug[chan];
+        inpw_udraw_debug(chan, &out->udraw_ext, out->ext_id, &out->ext_id_read);
+    }
+    return true;
 }
 
 /* The adapter's ports and USB pads read like a GameCube pad, through the
@@ -610,12 +704,10 @@ int32_t inpw_pads_init(uint32_t flags)
         /* The Pro Controller and the Wii Remote both, as snes9xgx enables them. */
         WPADEnableURCC(TRUE);
         WPADEnableWiiRemote(TRUE);
-        for (int ch = 0; ch < 4; ch++) {
-            if (use_pointer)
-                KPADEnableDPD((KPADChan)ch);
-            else
+        /* The pointer is on by default; only turned off when asked. */
+        if (!use_pointer)
+            for (int ch = 0; ch < 4; ch++)
                 KPADDisableDPD((KPADChan)ch);
-        }
     }
     memset(&vcache, 0, sizeof(vcache));
     memset(kcache, 0, sizeof(kcache));
@@ -660,9 +752,11 @@ void inpw_pads_update(void)
 
     if (use_vpad)
         read_gamepad();
-    if (use_kpad)
+    if (use_kpad) {
+        inpw_udraw_update();
         for (int ch = 0; ch < 4; ch++)
             read_remote(ch, dt);
+    }
 
     inpw_gcadapter_update();
     for (int port = 0; port < 4; port++) {
