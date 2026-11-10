@@ -346,7 +346,8 @@ static void read_gamepad(void)
     stick_feed(INPUT_STICK_LEFT, "GamePad", vcache.st.leftStick.x, vcache.st.leftStick.y);
     stick_feed(INPUT_STICK_RIGHT, "GamePad", vcache.st.rightStick.x, vcache.st.rightStick.y);
 
-    const VPADVec3D *a = &vcache.st.accelorometer.acc;
+    /* wut spells the field accelorometer or accelerometer by version; it is VPADStatus's member at 0x1C either way */
+    const VPADVec3D *a = (const VPADVec3D *)((const char *)&vcache.st + 0x1C);
     float g = sqrtf(a->x * a->x + a->y * a->y + a->z * a->z);
     if (g > gforce_max)
         gforce_max = g;
