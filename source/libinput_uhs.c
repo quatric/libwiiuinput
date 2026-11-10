@@ -489,7 +489,7 @@ uhsx_stream *uhsx_stream_start(uhsx_dev *d, uint8_t ep, uint32_t count, uint32_t
         }
         memset(st->w[k].buf, 0, count * size);
         /* Above the main thread (16): a late transfer is a lost one. */
-        if (!OSCreateThread(&st->w[k].thread, stream_worker, k, (char *)st, st->w[k].stack + STREAM_STACK,
+        if (!OSCreateThread(&st->w[k].thread, (OSThreadEntryPointFn)stream_worker, k, (char *)st, st->w[k].stack + STREAM_STACK,
                             STREAM_STACK, 12, OS_THREAD_ATTRIB_AFFINITY_ANY)) {
             uhsx_stream_stop(st);
             return NULL;
